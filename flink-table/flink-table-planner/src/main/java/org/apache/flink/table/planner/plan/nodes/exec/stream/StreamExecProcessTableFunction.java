@@ -22,20 +22,28 @@ import org.apache.flink.FlinkVersion;
 import org.apache.flink.api.common.state.StateTtlConfig;
 import org.apache.flink.api.dag.Transformation;
 import org.apache.flink.api.java.functions.KeySelector;
+import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.ReadableConfig;
+import org.apache.flink.core.memory.ManagedMemoryUseCase;
 import org.apache.flink.streaming.api.operators.ChainingStrategy;
+import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
 import org.apache.flink.streaming.api.transformations.KeyedMultipleInputTransformation;
+import org.apache.flink.streaming.api.transformations.OneInputTransformation;
 import org.apache.flink.table.api.DataTypes;
+import org.apache.flink.table.api.TableException;
 import org.apache.flink.table.connector.ChangelogMode;
+import org.apache.flink.table.connector.Projection;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.functions.ProcessTableFunction;
 import org.apache.flink.table.functions.TableSemantics;
+import org.apache.flink.table.functions.python.PythonProcessTableFunction;
 import org.apache.flink.table.planner.calcite.FlinkTypeFactory;
 import org.apache.flink.table.planner.calcite.RexTableArgCall;
 import org.apache.flink.table.planner.codegen.CodeGeneratorContext;
 import org.apache.flink.table.planner.codegen.EqualiserCodeGenerator;
 import org.apache.flink.table.planner.codegen.HashCodeGenerator;
 import org.apache.flink.table.planner.codegen.ProcessTableRunnerGenerator;
+import org.apache.flink.table.planner.codegen.PythonProcessTableProjectionCodeGenerator;
 import org.apache.flink.table.planner.codegen.sort.SortCodeGenerator;
 import org.apache.flink.table.planner.delegation.PlannerBase;
 import org.apache.flink.table.planner.functions.bridging.BridgingSqlFunction;
@@ -47,12 +55,14 @@ import org.apache.flink.table.planner.plan.nodes.exec.InputProperty;
 import org.apache.flink.table.planner.plan.nodes.exec.SingleTransformationTranslator;
 import org.apache.flink.table.planner.plan.nodes.exec.StateMetadata;
 import org.apache.flink.table.planner.plan.nodes.exec.spec.SortSpec;
+import org.apache.flink.table.planner.plan.nodes.exec.utils.CommonPythonUtil;
 import org.apache.flink.table.planner.plan.nodes.exec.utils.ExecNodeUtil;
 import org.apache.flink.table.planner.plan.nodes.exec.utils.TransformationMetadata;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalProcessTableFunction;
 import org.apache.flink.table.planner.plan.utils.KeySelectorUtil;
 import org.apache.flink.table.runtime.generated.GeneratedHashFunction;
 import org.apache.flink.table.runtime.generated.GeneratedProcessTableRunner;
+import org.apache.flink.table.runtime.generated.GeneratedProjection;
 import org.apache.flink.table.runtime.generated.GeneratedRecordComparator;
 import org.apache.flink.table.runtime.generated.GeneratedRecordEqualiser;
 import org.apache.flink.table.runtime.keyselector.RowDataKeySelector;
@@ -77,7 +87,10 @@ import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.rex.RexNode;
 import org.checkerframework.checker.nullness.qual.Nullable;
 
+import java.lang.reflect.Constructor;
+import java.lang.reflect.InvocationTargetException;
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.stream.Collectors;
@@ -211,6 +224,18 @@ public class StreamExecProcessTableFunction extends ExecNodeBase<RowData>
                 new CodeGeneratorContext(config, planner.getFlinkContext().getClassLoader());
 
         final RexCall udfCall = StreamPhysicalProcessTableFunction.toUdfCall(invocation);
+        if (((BridgingSqlFunction) udfCall.getOperator()).getDefinition()
+                instanceof PythonProcessTableFunction) {
+            return translatePythonProcessTableFunction(
+                    planner,
+                    config,
+                    inputTransforms,
+                    runtimeTableSemantics,
+                    ctx,
+                    udfCall,
+                    (PythonProcessTableFunction)
+                            ((BridgingSqlFunction) udfCall.getOperator()).getDefinition());
+        }
         final GeneratedRunnerResult generated =
                 ProcessTableRunnerGenerator.generate(
                         ctx,
@@ -310,6 +335,159 @@ public class StreamExecProcessTableFunction extends ExecNodeBase<RowData>
         }
 
         return transform;
+    }
+
+    private Transformation<RowData> translatePythonProcessTableFunction(
+            PlannerBase planner,
+            ExecNodeConfig config,
+            List<Transformation<RowData>> inputTransforms,
+            List<RuntimeTableSemantics> runtimeTableSemantics,
+            CodeGeneratorContext codeGeneratorContext,
+            RexCall udfCall,
+            PythonProcessTableFunction function) {
+        if (inputTransforms.size() != 1 || runtimeTableSemantics.size() != 1) {
+            throw new TableException(
+                    "Python process table functions support exactly one table input.");
+        }
+        final RuntimeTableSemantics semantics = runtimeTableSemantics.get(0);
+        if (semantics.orderByColumns().length > 0) {
+            throw new TableException("Python process table functions do not support ORDER BY.");
+        }
+        if (function.hasOnTimer() && semantics.passColumnsThrough()) {
+            throw new TableException(
+                    "Python process table function timers do not support pass-through columns.");
+        }
+        if (!inputChangelogModes.get(0).equals(ChangelogMode.insertOnly())
+                || !outputChangelogMode.equals(ChangelogMode.insertOnly())) {
+            throw new TableException(
+                    "Python process table functions support append-only input and output.");
+        }
+
+        final ClassLoader classLoader = planner.getFlinkContext().getClassLoader();
+        final Configuration pythonConfig =
+                CommonPythonUtil.extractPythonConfiguration(planner.getTableConfig(), classLoader);
+        if (!CommonPythonUtil.isPythonWorkerInProcessMode(pythonConfig, classLoader)) {
+            throw new TableException(
+                    "Python process table functions only support process execution mode.");
+        }
+
+        final Transformation<RowData> inputTransform = inputTransforms.get(0);
+        final RowType inputType =
+                ((InternalTypeInfo<RowData>) inputTransform.getOutputType()).toRowType();
+        final RowType resultType = (RowType) function.getResultType().getLogicalType();
+        final RowType keyType =
+                semantics.hasSetSemantics()
+                        ? (RowType) Projection.of(semantics.partitionByColumns()).project(inputType)
+                        : new RowType(List.of());
+        final PythonProcessTableProjectionCodeGenerator.Result projectionResult =
+                PythonProcessTableProjectionCodeGenerator.generate(
+                        codeGeneratorContext,
+                        udfCall,
+                        inputType,
+                        Arrays.asList(function.getArgumentNames()));
+
+        final List<RuntimeStateInfo> runtimeStateInfos =
+                IntStream.range(0, function.getStateNames().length)
+                        .mapToObj(
+                                i ->
+                                        new RuntimeStateInfo(
+                                                function.getStateNames()[i],
+                                                function.getStateDataTypes()[i],
+                                                deriveStateTimeToLive(
+                                                        function.getStateTimeToLive()[i],
+                                                        config.getStateRetentionTime())))
+                        .collect(Collectors.toList());
+        final OneInputStreamOperator<RowData, RowData> operator =
+                createPythonProcessTableOperator(
+                        classLoader,
+                        pythonConfig,
+                        function,
+                        semantics,
+                        runtimeStateInfos,
+                        inputType,
+                        projectionResult.getArgumentType(),
+                        resultType,
+                        keyType,
+                        projectionResult.getProjection());
+
+        final String effectiveUid =
+                uid != null ? uid : createTransformationUid(PROCESS_TRANSFORMATION, config);
+        final TransformationMetadata metadata =
+                new TransformationMetadata(
+                        effectiveUid,
+                        createTransformationName(config),
+                        createTransformationDescription(config));
+        final OneInputTransformation<RowData, RowData> transform =
+                ExecNodeUtil.createOneInputTransformation(
+                        inputTransform,
+                        metadata,
+                        operator,
+                        InternalTypeInfo.of(getOutputType()),
+                        inputTransform.getParallelism(),
+                        false);
+        if (semantics.hasSetSemantics()) {
+            final RowDataKeySelector selector =
+                    KeySelectorUtil.getRowDataSelector(
+                            classLoader,
+                            semantics.partitionByColumns(),
+                            (InternalTypeInfo<RowData>) inputTransform.getOutputType());
+            transform.setStateKeySelector(selector);
+            transform.setStateKeyType(selector.getProducedType());
+        }
+        if (CommonPythonUtil.isPythonWorkerUsingManagedMemory(pythonConfig, classLoader)) {
+            transform.declareManagedMemoryUseCaseAtSlotScope(ManagedMemoryUseCase.PYTHON);
+        }
+        if (inputsContainSingleton()) {
+            transform.setParallelism(1);
+            transform.setMaxParallelism(1);
+        }
+        return transform;
+    }
+
+    private static OneInputStreamOperator<RowData, RowData> createPythonProcessTableOperator(
+            ClassLoader classLoader,
+            Configuration pythonConfig,
+            PythonProcessTableFunction function,
+            RuntimeTableSemantics semantics,
+            List<RuntimeStateInfo> stateInfos,
+            RowType inputType,
+            RowType argumentType,
+            RowType resultType,
+            RowType keyType,
+            GeneratedProjection projection) {
+        final String className =
+                "org.apache.flink.table.runtime.operators.python.process."
+                        + "PythonProcessTableFunctionOperator";
+        try {
+            final Class<?> clazz = CommonPythonUtil.loadClass(className, classLoader);
+            final Constructor<?> constructor =
+                    clazz.getConstructor(
+                            Configuration.class,
+                            PythonProcessTableFunction.class,
+                            RuntimeTableSemantics.class,
+                            List.class,
+                            RowType.class,
+                            RowType.class,
+                            RowType.class,
+                            RowType.class,
+                            GeneratedProjection.class);
+            return (OneInputStreamOperator<RowData, RowData>)
+                    constructor.newInstance(
+                            pythonConfig,
+                            function,
+                            semantics,
+                            stateInfos,
+                            inputType,
+                            argumentType,
+                            resultType,
+                            keyType,
+                            projection);
+        } catch (NoSuchMethodException
+                | InstantiationException
+                | IllegalAccessException
+                | InvocationTargetException e) {
+            throw new TableException("Could not construct the Python PTF operator.", e);
+        }
     }
 
     private RuntimeTableSemantics createRuntimeTableSemantics(

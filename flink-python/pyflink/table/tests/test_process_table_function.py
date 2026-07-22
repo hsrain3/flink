@@ -1,0 +1,432 @@
+################################################################################
+#  Licensed to the Apache Software Foundation (ASF) under one
+#  or more contributor license agreements.  See the NOTICE file
+#  distributed with this work for additional information
+#  regarding copyright ownership.  The ASF licenses this file
+#  to you under the Apache License, Version 2.0 (the
+#  "License"); you may not use this file except in compliance
+#  with the License.  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+# limitations under the License.
+################################################################################
+
+from pyflink.common import Duration, Row
+from pyflink.table import DataTypes, EnvironmentSettings, TableEnvironment
+from pyflink.table.expressions import col, descriptor, lit
+from pyflink.table.udf import (
+    ProcessTableFunction,
+    ProcessTableFunctionArgument,
+    ProcessTableFunctionArgumentTrait as Trait,
+    ProcessTableFunctionState,
+    udptf,
+)
+from pyflink.testing.test_case_utils import PyFlinkTestCase
+
+
+class Tokenize(ProcessTableFunction):
+    def eval(self, ctx, event, separator):
+        for token in event.text.split(separator):
+            if token:
+                yield Row(token, separator)
+
+
+class CountWithTimeout(ProcessTableFunction):
+    def eval(self, ctx, memory, event, timeout_ms):
+        memory["count"] = (memory.count or 0) + 1
+        event_time = ctx.time_context(int).time()
+        if event_time is not None:
+            ctx.time_context(int).register_on_time("timeout", event_time + timeout_ms)
+        yield Row(memory.count, "event")
+
+    def on_timer(self, ctx, memory):
+        yield Row(memory.count, ctx.current_timer())
+        ctx.clear_all()
+
+
+class CountByKey(ProcessTableFunction):
+    def eval(self, ctx, memory, event):
+        memory["count"] = (memory.count or 0) + 1
+        yield Row(memory.count)
+
+
+class OptionalOnTimeTimer(ProcessTableFunction):
+    def eval(self, ctx, event):
+        ctx.time_context(int).register_on_time("timeout", 0)
+        yield Row("event")
+
+    def on_timer(self, ctx):
+        yield Row(ctx.current_timer())
+
+
+class PassThroughLength(ProcessTableFunction):
+    def eval(self, ctx, event):
+        yield Row(len(event.text))
+
+
+class ProcessTableFunctionTests(PyFlinkTestCase):
+
+    @staticmethod
+    def _tokenize_function():
+        return udptf(
+            Tokenize(),
+            arguments=[
+                ProcessTableFunctionArgument.table(
+                    "event", traits={Trait.ROW_SEMANTIC_TABLE}),
+                ProcessTableFunctionArgument.scalar("separator", DataTypes.STRING()),
+            ],
+            result_type=DataTypes.ROW([
+                DataTypes.FIELD("text", DataTypes.STRING()),
+                DataTypes.FIELD("separator", DataTypes.STRING()),
+            ]),
+        )
+
+    @staticmethod
+    def _count_with_timeout_function():
+        return udptf(
+            CountWithTimeout(),
+            arguments=[
+                ProcessTableFunctionArgument.table(
+                    "event", traits={Trait.SET_SEMANTIC_TABLE, Trait.REQUIRE_ON_TIME}),
+                ProcessTableFunctionArgument.scalar("timeout_ms", DataTypes.BIGINT()),
+            ],
+            states=[
+                ProcessTableFunctionState.value(
+                    "memory",
+                    DataTypes.ROW([DataTypes.FIELD("count", DataTypes.BIGINT())]),
+                    ttl=Duration.of_days(1),
+                )
+            ],
+            result_type=DataTypes.ROW([
+                DataTypes.FIELD("count", DataTypes.BIGINT()),
+                DataTypes.FIELD("trigger", DataTypes.STRING()),
+            ]),
+        )
+
+    @staticmethod
+    def _count_by_key_function(optional_partition=False):
+        traits = {Trait.SET_SEMANTIC_TABLE}
+        if optional_partition:
+            traits.add(Trait.OPTIONAL_PARTITION_BY)
+        return udptf(
+            CountByKey(),
+            arguments=[ProcessTableFunctionArgument.table("event", traits=traits)],
+            states=[ProcessTableFunctionState.value(
+                "memory", DataTypes.ROW([DataTypes.FIELD("count", DataTypes.BIGINT())]))],
+            result_type=DataTypes.ROW([DataTypes.FIELD("count", DataTypes.BIGINT())]),
+        )
+
+    @staticmethod
+    def _optional_on_time_timer_function():
+        return udptf(
+            OptionalOnTimeTimer(),
+            arguments=[ProcessTableFunctionArgument.table(
+                "event", traits={Trait.SET_SEMANTIC_TABLE})],
+            result_type=DataTypes.ROW([DataTypes.FIELD("trigger", DataTypes.STRING())]),
+        )
+
+    def test_create_stateless_function(self):
+        function = self._tokenize_function()
+
+        java_function = function._java_user_defined_function()
+        self.assertEqual("PythonProcessTableFunction", java_function.getClass().getSimpleName())
+        static_arguments = java_function.getTypeInference(None).getStaticArguments().get()
+        self.assertEqual(["event", "separator"], [a.getName() for a in static_arguments])
+
+    def test_table_process_and_from_call_plan(self):
+        table_env = TableEnvironment.create(EnvironmentSettings.in_streaming_mode())
+        table_env.create_temporary_system_function("tokenize", self._tokenize_function())
+        events = table_env.from_elements(
+            [("hello world",)],
+            DataTypes.ROW([DataTypes.FIELD("text", DataTypes.STRING())]))
+
+        implicit_result = events.process(
+            "tokenize", lit(" ").as_argument("separator"))
+        explicit_result = table_env.from_call(
+            "tokenize",
+            events.as_argument("event"),
+            lit(" ").as_argument("separator"))
+
+        self.assertEqual(["text", "separator"],
+                         implicit_result.get_schema().get_field_names())
+        self.assertEqual(["text", "separator"],
+                         explicit_result.get_schema().get_field_names())
+        self.assertIn("ProcessTableFunction", implicit_result.explain())
+        self.assertIn("ProcessTableFunction", explicit_result.explain())
+
+    def test_call_java_process_table_functions(self):
+        table_env = TableEnvironment.create(EnvironmentSettings.in_streaming_mode())
+        function_prefix = (
+            "org.apache.flink.table.runtime.operators.python.process."
+            "TestJavaProcessTableFunctions$")
+        table_env.create_java_temporary_system_function(
+            "java_row_ptf", function_prefix + "RowSemanticFunction")
+        table_env.create_java_temporary_system_function(
+            "java_multi_ptf", function_prefix + "MultiInputFunction")
+        orders = table_env.from_elements(
+            [("Alice", 1)],
+            DataTypes.ROW([
+                DataTypes.FIELD("name", DataTypes.STRING()),
+                DataTypes.FIELD("score", DataTypes.INT()),
+            ]))
+        profiles = table_env.from_elements(
+            [("Alice", 2)],
+            DataTypes.ROW([
+                DataTypes.FIELD("name", DataTypes.STRING()),
+                DataTypes.FIELD("score", DataTypes.INT()),
+            ]))
+
+        single = orders.process("java_row_ptf", lit(42).as_argument("increment"))
+        multiple = table_env.from_call(
+            "java_multi_ptf",
+            orders.partition_by(col("name")).as_argument("in1"),
+            profiles.partition_by(col("name")).as_argument("in2"),
+        )
+
+        self.assertEqual(["out"], single.get_schema().get_field_names())
+        self.assertEqual(["name", "name0", "out"],
+                         multiple.get_schema().get_field_names())
+        self.assertIn("ProcessTableFunction", single.explain())
+        self.assertIn("ProcessTableFunction", multiple.explain())
+        with single.execute().collect() as rows:
+            self.assertEqual([Row("Alice:42")], list(rows))
+
+    def test_stateless_execution(self):
+        table_env = TableEnvironment.create(EnvironmentSettings.in_streaming_mode())
+        table_env.get_config().set("python.fn-execution.bundle.size", "1")
+        table_env.create_temporary_system_function("tokenize", self._tokenize_function())
+        events = table_env.from_elements(
+            [("hello world",), ("flink",)],
+            DataTypes.ROW([DataTypes.FIELD("text", DataTypes.STRING())]))
+
+        result = events.process("tokenize", lit(" ").as_argument("separator"))
+
+        with result.execute().collect() as rows:
+            actual = sorted((row[0], row[1]) for row in rows)
+        self.assertEqual(
+            [("flink", " "), ("hello", " "), ("world", " ")], actual)
+
+    def test_create_stateful_timer_function(self):
+        function = self._count_with_timeout_function()
+
+        java_function = function._java_user_defined_function()
+        self.assertTrue(java_function.hasOnTimer())
+        state_strategies = java_function.getTypeInference(None).getStateTypeStrategies()
+        self.assertEqual(["memory"], list(state_strategies.keySet()))
+
+    def test_stateful_timer_plan(self):
+        table_env = TableEnvironment.create(EnvironmentSettings.in_streaming_mode())
+        function = self._count_with_timeout_function()
+        table_env.create_temporary_system_function("count_with_timeout", function)
+        table_env.execute_sql("""
+            CREATE TEMPORARY TABLE events (
+                user_id STRING,
+                text STRING,
+                ts TIMESTAMP_LTZ(3),
+                WATERMARK FOR ts AS ts - INTERVAL '1' SECOND
+            ) WITH (
+                'connector' = 'datagen',
+                'number-of-rows' = '1'
+            )
+        """)
+
+        result = table_env.from_path("events").partition_by(col("user_id")).process(
+            "count_with_timeout",
+            lit(60_000).as_argument("timeout_ms"),
+            descriptor("ts").as_argument("on_time"))
+
+        self.assertEqual(["user_id", "count", "trigger", "rowtime"],
+                         result.get_schema().get_field_names())
+        plan = result.explain()
+        self.assertIn("ProcessTableFunction", plan)
+        self.assertIn("Exchange", plan)
+
+    def test_stateful_named_timer_execution(self):
+        table_env = TableEnvironment.create(EnvironmentSettings.in_streaming_mode())
+        table_env.get_config().set("python.fn-execution.bundle.size", "1")
+        table_env.create_temporary_system_function(
+            "count_with_timeout", self._count_with_timeout_function())
+        table_env.execute_sql("""
+            CREATE TEMPORARY TABLE timer_events (
+                user_id BIGINT,
+                ts TIMESTAMP_LTZ(3),
+                WATERMARK FOR ts AS ts
+            ) WITH (
+                'connector' = 'datagen',
+                'number-of-rows' = '1',
+                'fields.user_id.kind' = 'sequence',
+                'fields.user_id.start' = '1',
+                'fields.user_id.end' = '1'
+            )
+        """)
+
+        result = table_env.from_path("timer_events").partition_by(col("user_id")).process(
+            "count_with_timeout",
+            lit(0).as_argument("timeout_ms"),
+            descriptor("ts").as_argument("on_time")).select(col("count"), col("trigger"))
+
+        with result.execute().collect() as rows:
+            actual = sorted((row[0], row[1]) for row in rows)
+        self.assertEqual([(1, "event"), (1, "timeout")], actual)
+
+    def test_state_is_isolated_by_partition_key(self):
+        table_env = TableEnvironment.create(EnvironmentSettings.in_streaming_mode())
+        table_env.get_config().set("python.fn-execution.bundle.size", "1")
+        table_env.create_temporary_system_function(
+            "count_by_key", self._count_by_key_function())
+        events = table_env.from_elements(
+            [(1,), (2,), (1,)],
+            DataTypes.ROW([DataTypes.FIELD("user_id", DataTypes.BIGINT())]))
+
+        result = events.partition_by(col("user_id")).process("count_by_key")
+
+        with result.execute().collect() as rows:
+            actual = sorted((row[0], row[1]) for row in rows)
+        self.assertEqual([(1, 1), (1, 2), (2, 1)], actual)
+
+    def test_optional_partition_uses_global_state(self):
+        table_env = TableEnvironment.create(EnvironmentSettings.in_streaming_mode())
+        table_env.get_config().set("python.fn-execution.bundle.size", "1")
+        table_env.create_temporary_system_function(
+            "global_count", self._count_by_key_function(optional_partition=True))
+        events = table_env.from_elements(
+            [(1,), (2,), (3,)],
+            DataTypes.ROW([DataTypes.FIELD("value", DataTypes.BIGINT())]))
+
+        result = events.process("global_count")
+
+        with result.execute().collect() as rows:
+            actual = sorted(row[0] for row in rows)
+        self.assertEqual([1, 2, 3], actual)
+
+    def test_pass_through_columns_execution(self):
+        table_env = TableEnvironment.create(EnvironmentSettings.in_streaming_mode())
+        table_env.get_config().set("python.fn-execution.bundle.size", "1")
+        function = udptf(
+            PassThroughLength(),
+            arguments=[ProcessTableFunctionArgument.table(
+                "event", traits={Trait.ROW_SEMANTIC_TABLE, Trait.PASS_COLUMNS_THROUGH})],
+            result_type=DataTypes.ROW([DataTypes.FIELD("length", DataTypes.INT())]),
+        )
+        table_env.create_temporary_system_function("pass_length", function)
+        events = table_env.from_elements(
+            [("flink", "stream")],
+            DataTypes.ROW([
+                DataTypes.FIELD("text", DataTypes.STRING()),
+                DataTypes.FIELD("category", DataTypes.STRING()),
+            ]))
+
+        result = events.process("pass_length")
+
+        self.assertEqual(["text", "category", "length"],
+                         result.get_schema().get_field_names())
+        with result.execute().collect() as rows:
+            self.assertEqual([Row("flink", "stream", 5)], list(rows))
+
+    def test_timer_execution_without_on_time_argument(self):
+        table_env = TableEnvironment.create(EnvironmentSettings.in_streaming_mode())
+        table_env.get_config().set("python.fn-execution.bundle.size", "1")
+        table_env.create_temporary_system_function(
+            "optional_on_time", self._optional_on_time_timer_function())
+        table_env.execute_sql("""
+            CREATE TEMPORARY TABLE optional_timer_events (
+                user_id BIGINT,
+                sequence_id BIGINT,
+                ts AS TO_TIMESTAMP_LTZ(sequence_id * 1000, 3),
+                WATERMARK FOR ts AS ts
+            ) WITH (
+                'connector' = 'datagen',
+                'number-of-rows' = '1',
+                'fields.user_id.kind' = 'sequence',
+                'fields.user_id.start' = '1',
+                'fields.user_id.end' = '1',
+                'fields.sequence_id.kind' = 'sequence',
+                'fields.sequence_id.start' = '1',
+                'fields.sequence_id.end' = '1'
+            )
+        """)
+
+        result = table_env.from_path("optional_timer_events").partition_by(
+            col("user_id")).process("optional_on_time").select(col("trigger"))
+
+        self.assertEqual(["trigger"], result.get_schema().get_field_names())
+        with result.execute().collect() as rows:
+            actual = sorted(row[0] for row in rows)
+        self.assertEqual(["event", "timeout"], actual)
+
+    def test_rejects_invalid_eval_signature(self):
+        class Invalid(ProcessTableFunction):
+            def eval(self, ctx, separator, event):
+                return ()
+
+        with self.assertRaisesRegex(ValueError, "Expected \\(ctx, event, separator\\)"):
+            udptf(
+                Invalid(),
+                arguments=[
+                    ProcessTableFunctionArgument.table("event"),
+                    ProcessTableFunctionArgument.scalar("separator", DataTypes.STRING()),
+                ],
+                result_type=DataTypes.ROW([DataTypes.FIELD("v", DataTypes.STRING())]),
+            )
+
+    def test_state_requires_set_semantics(self):
+        class Stateful(ProcessTableFunction):
+            def eval(self, ctx, memory, event):
+                return ()
+
+        with self.assertRaisesRegex(ValueError, "State requires"):
+            udptf(
+                Stateful(),
+                arguments=[ProcessTableFunctionArgument.table("event")],
+                states=[ProcessTableFunctionState.value(
+                    "memory", DataTypes.ROW([DataTypes.FIELD("v", DataTypes.INT())]))],
+                result_type=DataTypes.ROW([DataTypes.FIELD("v", DataTypes.INT())]),
+            )
+
+    def test_timer_allows_optional_on_time(self):
+        class Timer(ProcessTableFunction):
+            def eval(self, ctx, event):
+                return ()
+
+            def on_timer(self, ctx):
+                return ()
+
+        function = udptf(
+            Timer(),
+            arguments=[ProcessTableFunctionArgument.table(
+                "event", traits={Trait.SET_SEMANTIC_TABLE})],
+            result_type=DataTypes.ROW([DataTypes.FIELD("v", DataTypes.INT())]),
+        )
+
+        self.assertTrue(function._java_user_defined_function().hasOnTimer())
+
+    def test_timer_rejects_pass_through_columns(self):
+        class Timer(ProcessTableFunction):
+            def eval(self, ctx, event):
+                return ()
+
+            def on_timer(self, ctx):
+                return ()
+
+        with self.assertRaisesRegex(ValueError, "pass-through columns"):
+            udptf(
+                Timer(),
+                arguments=[ProcessTableFunctionArgument.table(
+                    "event",
+                    traits={
+                        Trait.SET_SEMANTIC_TABLE,
+                        Trait.REQUIRE_ON_TIME,
+                        Trait.PASS_COLUMNS_THROUGH,
+                    })],
+                result_type=DataTypes.ROW([DataTypes.FIELD("v", DataTypes.INT())]),
+            )
+
+
+if __name__ == '__main__':
+    import unittest
+    unittest.main()

@@ -548,7 +548,7 @@ def report(transactions):
 
 This query consumes all records from the `transactions` table, calculates the report, and outputs the results in an efficient, scalable manner. Running the test with this implementation will pass.
 
-## Process Table Functions (Java only)
+## Process Table Functions
 
 For more advanced row-by-row processing, Flink provides [Process Table Functions]({{< ref "docs/dev/table/functions/ptfs" >}}) (PTFs). PTFs can transform each row of a table and have access to powerful features like state and timers. Here's a simple stateless example that filters and formats high-value transactions:
 
@@ -587,7 +587,9 @@ alerts.execute().print();
 This will output alerts only for transactions exceeding 500. PTFs become even more powerful when combined with state and timers for implementing complex event-driven logic - see the [PTF documentation]({{< ref "docs/dev/table/functions/ptfs" >}}) for more advanced examples.
 
 {{< hint info >}}
-**Note:** Process Table Functions are currently only available in Java. For Python, you can use [User-Defined Table Functions]({{< ref "docs/dev/table/functions/udfs" >}}#table-functions) (UDTFs) for similar row-by-row processing.
+**Note:** This getting-started example uses Java. PyFlink can also define and call PTFs through
+the Python Table API. See the [PTF documentation]({{< ref "docs/dev/table/functions/ptfs" >}}#pyflink-support)
+for examples and the currently supported feature set.
 {{< /hint >}}
 
 ## Adding Windows

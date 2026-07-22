@@ -606,7 +606,9 @@ def descriptor(*column_names: str) -> Expression:
     :param column_names: One or more column names.
     :return: A descriptor expression.
     """
-    return _varargs_op("descriptor", *column_names)
+    gateway = get_gateway()
+    return Expression(gateway.jvm.Expressions.descriptor(
+        to_jarray(gateway.jvm.String, column_names)))
 
 
 @PublicEvolving()

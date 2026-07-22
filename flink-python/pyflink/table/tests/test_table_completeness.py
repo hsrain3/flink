@@ -39,9 +39,6 @@ class TableAPICompletenessTests(PythonAPICompletenessTestCase, PyFlinkTestCase):
         return {
             'createTemporalTableFunction',
             'getQueryOperation',
-            'asArgument',
-            'process',
-            'partitionBy',
         }
 
     @classmethod
