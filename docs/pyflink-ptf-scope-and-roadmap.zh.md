@@ -20,7 +20,7 @@ limitations under the License.
 
 ## 目标
 
-PyFlink PTF 首版以打通单表输入的 Streaming PTF 完整链路为目标，而不是一次性实现与
+PyFlink PTF Phase 1 以补齐单表输入的 Streaming PTF 完整链路为目标，而不是一次性实现与
 Java PTF 的全部功能对齐。
 
 用户可以继承 `ProcessTableFunction`，通过 `udptf()` 声明有序参数、状态和结果类型，
@@ -85,36 +85,39 @@ PyFlink 已有一些可复用但不等价于 Python PTF 的能力：
 
 ### 当前工作区实现
 
-本文所描述的 Python PTF 首版已经在当前工作区完成原型实现，包括 Python API、Java
+本文所描述的 Python PTF Phase 1 已经在当前功能分支实现，包括 Python API、Java
 占位函数、共享 PTF planner 的 Python 分支、单输入 operator、PTF Beam runner、Python
-worker、Value State、事件时间 Timer bridge 和相应测试。该实现复用社区 Java PTF
-语义以及现有 Flink/Python state、checkpoint、watermark 和 Beam 基础设施。
+worker、Value State、State Views、事件时间 Timer bridge、`ORDER BY`、TableSemantics、
+changelog 和最小恢复验证。该实现复用社区 Java PTF 语义以及现有 Flink/Python state、
+checkpoint、watermark 和 Beam 基础设施。
 
-但是，这些文件目前是本地未提交修改，尚未通过 Apache Flink 社区的 FLIP、代码审查和
-发布流程。因此本文中的“已实现”仅表示当前工作区状态，不表示 Apache Flink 稳定版或
-社区 `master` 已支持 Python-defined PTF。新增 PyFlink 公共 API 在合入前仍需要获得
-FLIP 批准，并补充 JIRA、release note、兼容性说明和社区级 CI 验证。
+这些改动尚未通过 Apache Flink 社区的 FLIP、代码审查和发布流程。因此本文中的
+“已实现”仅表示当前功能分支状态，不表示 Apache Flink 稳定版或社区 `master` 已支持
+Python-defined PTF。新增 PyFlink 公共 API 在合入前仍需要获得 FLIP 批准，并补充 JIRA、
+release note、兼容性说明和社区级 CI 验证。
 
-## 首版支持范围
+## Phase 1 支持范围
 
-| 领域 | 首版支持范围 | 对应 Case |
+| 领域 | Phase 1 支持范围 | 对应 Case |
 |------|--------------|-----------|
 | 定义方式 | 继承 `ProcessTableFunction` 并通过 `udptf()` 创建 Python PTF | Case 1 |
-| 调用方式 | 注册名称后使用 `Table.process()` 或 `TableEnvironment.from_call()` | Case 2 |
+| 调用方式 | 注册名称后使用 `Table.process()`、`TableEnvironment.from_call()` 或 SQL | Case 2、17 |
 | 参数 | 恰好一个表参数，以及零个或多个按声明顺序注入的标量参数 | Case 3 |
-| 表语义 | 无状态处理支持 Row semantics；状态和 Timer 支持 Set semantics 以及必选或可选分区 | Case 4 |
+| 表语义 | 支持 Row/Set semantics、分区以及单表核心 `TableSemantics` metadata | Case 4、14 |
 | 表参数 Trait | 支持 pass-through columns 和 required on-time，但 Timer 不能与 pass-through columns 同时使用 | Case 5 |
-| 状态 | 一个或多个 keyed `ROW` Value State，支持可变 `Row` 注入、显式清理和独立 TTL | Case 6 |
+| 排序 | 支持 Set semantics 的 `ORDER BY`、watermark 释放、次级排序和迟到数据处理 | Case 13 |
+| 状态 | 支持一个或多个 keyed `ROW` Value State、`ListView` 和 `MapView`，以及显式清理、独立 TTL 和增量访问 | Case 6、16 |
 | 时间 | 使用 epoch 毫秒、`Instant` 或 UTC-naive `datetime` 访问事件时间、表 watermark 和当前 PTF watermark | Case 7 |
 | Timer | 支持 named 和 anonymous 事件时间 Timer，以及替换、单个删除、全部清理和回调 | Case 8 |
 | 输出 | 支持 0-N 条 `ROW` 结果，并组合分区键、pass-through 列和可选 rowtime | Case 9 |
-| Runtime | Streaming、Process Python worker、append-only 输入和输出 | Case 10 |
-| 可靠性 | 状态和 Timer 使用 Flink managed state；watermark、checkpoint 和 end-of-input 前刷新 bundle、状态请求和 Timer 命令 | Case 11 |
+| Changelog | 支持 append/upsert/retract 输入输出及更新 Trait，输入输出保留 `RowKind` | Case 15 |
+| Runtime | Streaming 和 Process Python worker | Case 10 |
+| 可靠性 | 状态、排序缓冲和 Timer 使用 Flink managed state；具备固定并行度 HashMap backend 的最小 checkpoint/failover/TTL 恢复验证 | Case 11、18 |
 | Java 互操作 | PyFlink 可以调用已注册的 Java PTF，包括多表输入 Java PTF | Case 12 |
 
-## 首版支持范围 Case
+## Phase 1 支持范围 Case
 
-下面的 case 与上表一一对应。示例假设 `events` 是 append-only 流表，包含
+下面的 case 与上表对应。除 changelog Case 外，示例假设 `events` 是 append-only 流表，包含
 `user_id STRING`、`text STRING` 和已定义 watermark 的 `ts TIMESTAMP_LTZ(3)`。
 
 ### Case 1：在 Python 中定义 PTF
@@ -363,15 +366,17 @@ t_env = TableEnvironment.create(EnvironmentSettings.in_streaming_mode())
 t_env.get_config().set("python.execution-mode", "process")
 ```
 
-**预期：** Python PTF 通过独立 Process Python worker 执行。Batch mode、Embedded/Thread mode、
-非 append-only 输入或非 `ROW` 结果会在 API 或 planner 阶段被拒绝。
+**预期：** Python PTF 通过独立 Process Python worker 执行。Batch mode、Embedded/Thread mode
+或非 `ROW` 结果会在 API 或 planner 阶段被拒绝；更新输入输出由声明的 Trait 和
+`ChangelogMode` 控制。
 
 ### Case 11：checkpoint、watermark 和恢复
 
 假设 key `A` 的状态计数为 3，并已注册事件时间 Timer `timeout@20s`：
 
 1. checkpoint barrier 到达时，operator 先刷新 Python bundle、远程状态请求和 Timer 命令。
-2. checkpoint 将 keyed Value State、named Timer 映射和 Flink internal Timer 一起持久化。
+2. checkpoint 将 keyed Value State、State Views、排序缓冲、named Timer 映射和 Flink
+   internal Timer 一起持久化。
 3. 任务故障并从该 checkpoint 恢复后，key `A` 的下一条输入从计数 3 继续，
    watermark 越过 20 秒时原 Timer 仍可触发。
 
@@ -403,6 +408,132 @@ multi_result = t_env.from_call(
 传入所有表参数。“恰好一个表参数”只限制 Python 定义的 PTF，不限制 PyFlink
 调用 Java PTF。
 
+### Case 13：`ORDER BY` 和 watermark 驱动释放
+
+```python
+ordered = events.partition_by(col("user_id")).order_by(
+    col("ts").asc,
+    col("priority").desc,
+)
+result = ordered.process(
+    "ordered_ptf",
+    descriptor("ts").as_argument("on_time"),
+)
+```
+
+**预期：** `eval()` 先按 `ts` 升序接收记录，相同 `ts` 再按 `priority` 降序接收。
+第一个排序列必须是带 watermark 的升序时间属性，并与 `on_time` 一致；watermark 推进后
+排序缓冲才释放，已经晚于 watermark 的记录按 Java PTF 规则丢弃。排序 MapState 和内部
+Timer 参与 checkpoint。
+
+### Case 14：读取当前表参数语义
+
+```python
+class InspectInput(ProcessTableFunction):
+    def eval(self, ctx, event):
+        semantics = ctx.table_semantics_for("event")
+        yield Row(
+            partition_columns=semantics.partition_by_columns(),
+            order_columns=semantics.order_by_columns(),
+            time_column=semantics.time_column(),
+        )
+```
+
+**预期：** context 返回调用点的实际 `DataType`、分区列、排序列及方向、时间列、输入
+changelog mode 和 upsert-key candidates。未知参数名抛出 `ValueError`，列集合以不可变
+tuple 返回；`ctx.get_changelog_mode()` 返回当前 Python PTF 声明的输出 mode。
+
+### Case 15：更新输入和 changelog 输出
+
+```python
+class ForwardChanges(ProcessTableFunction):
+    def eval(self, ctx, event):
+        yield Row.of_kind(event.get_row_kind(), value=event.value)
+
+
+forward_changes = udptf(
+    ForwardChanges(),
+    arguments=[ProcessTableFunctionArgument.table(
+        "event",
+        traits={Trait.SET_SEMANTIC_TABLE, Trait.SUPPORT_UPDATES},
+    )],
+    result_type=DataTypes.ROW([
+        DataTypes.FIELD("value", DataTypes.STRING()),
+    ]),
+    changelog_mode=ChangelogMode.all(),
+)
+```
+
+**预期：** 输入 `Row` 保留 `+I/-U/+U/-D`，输出 `RowKind` 不被重置为 INSERT，且运行时
+拒绝声明 mode 之外的输出。`REQUIRE_UPDATE_BEFORE` 要求 planner 提供 retract 编码，
+`REQUIRE_FULL_DELETE` 要求 DELETE 携带完整行。upsert 输出要求 Set semantics 且 upsert
+key 等于 `PARTITION BY` key；retract 输出不要求 upsert key，也可以用于 Row semantics。
+更新输入不能与 pass-through columns 组合，更新输出不能与 `on_time` 组合。
+
+### Case 16：`ListView`、`MapView` 和 Value State 混用
+
+```python
+class TrackHistory(ProcessTableFunction):
+    def eval(self, ctx, memory, history, counts, event):
+        memory["total"] = (memory.total or 0) + 1
+        history.add(event.value)
+        counts.put(event.value, (counts.get(event.value) or 0) + 1)
+        yield Row(memory.total, len(list(history.get())), counts.get(event.value))
+
+
+track_history = udptf(
+    TrackHistory(),
+    arguments=[ProcessTableFunctionArgument.table(
+        "event", traits={Trait.SET_SEMANTIC_TABLE})],
+    states=[
+        ProcessTableFunctionState.value(
+            "memory",
+            DataTypes.ROW([DataTypes.FIELD("total", DataTypes.BIGINT())])),
+        ProcessTableFunctionState.list_view(
+            "history", DataTypes.STRING(), ttl=Duration.of_days(1)),
+        ProcessTableFunctionState.map_view(
+            "counts", DataTypes.STRING(), DataTypes.BIGINT(),
+            ttl=Duration.of_days(7)),
+    ],
+    result_type=DataTypes.ROW([
+        DataTypes.FIELD("total", DataTypes.BIGINT()),
+        DataTypes.FIELD("history_size", DataTypes.INT()),
+        DataTypes.FIELD("value_count", DataTypes.BIGINT()),
+    ]),
+)
+```
+
+**预期：** View 操作直接访问 keyed managed state，不在回调前后整体复制集合。
+`ListView` 支持 `get/add/add_all/remove/clear`，`MapView` 支持单 key 读写、删除、contains、
+迭代和 clear。三个状态独立配置 TTL，并同时受 `clear_state()`、`clear_all_state()` 和
+`clear_all()` 控制。
+
+### Case 17：通过 SQL 调用已注册 Python PTF
+
+```python
+t_env.create_temporary_system_function("tokenize", tokenize)
+result = t_env.sql_query("""
+    SELECT *
+    FROM tokenize(event => TABLE events, `separator` => ' ')
+""")
+```
+
+**预期：** SQL 与 Table API 解析到同一个已注册 Python PTF 和同一套 planner/runtime
+链路。Phase 1 仍不支持在调用位置直接传入 inline Python 函数实例或函数类。
+
+### Case 18：Phase 1 最小恢复门禁
+
+固定并行度为 1，并使用默认 HashMap backend：
+
+1. 同一 key 连续累加 `ROW` Value State，并反复以同名 Timer 替换旧 deadline。
+2. 完成 checkpoint 后终止唯一 TaskManager，再启动替代 TaskManager。
+3. 作业恢复并处理完 1000 条限速输入后，序号和状态计数必须同为 1000；反复替换的
+   named Timer 在 end-of-input watermark 到达后只触发一次。
+4. 使用短 TTL 分别写入 Value State、`ListView` 和 `MapView`，过期后再次读取均不可见。
+
+**预期：** 该 Case 只证明 Phase 1 的最小 checkpoint、Timer 和 TTL 恢复闭环，不替代
+savepoint、rescale、多 backend、压力、性能或长期稳定性矩阵。
+
 ## API 约定
 
 状态和 Timer 使用固定的回调签名，状态参数位于函数参数之前：
@@ -424,33 +555,38 @@ def on_timer(self, ctx, state1, state2):
 - Python PTF 必须声明恰好一个表参数，不支持零表输入或多表输入。该限制不影响 PyFlink
   调用 Java PTF。
 - 仅支持 Streaming 和 Process Python worker，不支持 Batch 和 Embedded Python mode。
-- 输入和输出必须为 append-only，`result_type` 必须是 `ROW` 类型。
-- 不支持 `ORDER BY`、更新表参数、update-before、retraction 和 full-delete 语义。
-- 状态仅支持 `ROW` Value State，不支持 List State 和 Map State。
+- `result_type` 必须是顶层 `ROW` 类型，不支持顶层标量、`ARRAY`、`MAP`、`RAW` 或动态
+  结果类型。
+- 输出 changelog mode 必须在 `udptf()` 中固定声明，不支持根据 planning context 动态
+  选择输出 mode。
+- `table_semantics_for()` 覆盖单表核心 metadata，不包含尚未暴露的高级 Java context API。
 - 状态和 Timer 要求 Set semantics，Timer 不能与 pass-through columns 同时使用。
 - Timer 仅支持事件时间，并且注册 Timer 的函数必须实现 `on_timer()`。
 - Python PTF 必须先注册名称，不支持 inline Python 函数实例或函数类。
-- 首版以 Python Table API 为正式支持的调用入口，不包含更广泛的 SQL 调用覆盖。
+- 业务 scalar/table arguments 当前全部必填，不支持 optional arguments。
+- Phase 1 仅包含固定并行度、HashMap backend 的最小恢复门禁，不包含 savepoint、rescale、
+  多 backend、压力、性能和长期稳定性矩阵。
 
-## 后续规划
+## 阶段规划与当前状态
 
-以下内容表示后续实现方向，不构成兼容性或版本承诺。
+以下阶段用于说明当前功能边界和后续方向，不构成兼容性或版本承诺。
 
 ### 第一阶段：完整的单表 Python PTF
 
-第一阶段合并原“首版实现”“生产能力加固”和“单表 Java PTF 能力对齐”，目标是让
-Python PTF 覆盖完整的单表 Streaming 主路径：
+第一阶段目标是让 Python PTF 覆盖完整的单表 Streaming 主路径：
 
 - Python PTF 定义、注册，以及通过 Table API 或 SQL 调用已注册函数。
 - 恰好一个表输入和零个或多个标量参数。
 - Row/Set semantics、`PARTITION BY`、pass-through columns 和 `on_time`。
-- `ROW` Value State、独立 TTL、事件时间 Timer、显式清理和 checkpoint 恢复。
+- 事件时间 Timer、显式清理和 checkpoint 恢复。
 - append、upsert 和 retract 输入输出，以及 `SUPPORT_UPDATES`、
   `REQUIRE_UPDATE_BEFORE` 和 `REQUIRE_FULL_DELETE`。
 - `ORDER BY`、watermark 驱动的排序缓冲和排序状态恢复。
 - 核心 `ctx.table_semantics_for()`，覆盖输入类型、分区、排序、时间列和 changelog
   metadata。
-- 大 bundle、watermark、背压、checkpoint、故障恢复和性能测试。
+- 一个或多个 keyed `ROW` Value State、`ListView` 和 `MapView`，支持显式清理、独立
+  TTL 和增量访问。
+- 固定并行度、HashMap backend 下的最小 checkpoint、Timer 和 TTL 恢复门禁。
 
 阶段一内部按以下里程碑推进，但这些里程碑属于同一个单表能力阶段：
 
@@ -463,24 +599,32 @@ Python PTF 覆盖完整的单表 Streaming 主路径：
 - 支持 `ROW` Value State、TTL、named/anonymous 事件时间 Timer，以及 Process Python
   worker 执行链路。
 
-#### 1B Hardening：生产能力加固
-
-- 增加 Python Value State 和 Timer 故障恢复的端到端测试。
-- 增加 TTL 过期和 state backend 兼容性测试。
-- 覆盖大 bundle、背压、watermark 和 checkpoint 并发场景。
-- 建立状态访问和 Timer 密集场景的性能基线。
-
-#### 1C Parity：单表高级能力
+#### 1B Parity：单表语义对齐
 
 - 支持核心 table semantics 和 `ORDER BY`。
 - 支持更新表输入，以及 update-before、retraction 和 delete 消息。
 - 支持 Python PTF 以固定 `ChangelogMode` 声明并产出 append、upsert 或 retract
-  changelog；基于 planning context 动态选择 mode 不作为 1C 的前置条件。
+  changelog；基于 planning context 动态选择 mode 不作为 1B 的前置条件。
 - 验证已注册 Python PTF 的 SQL 调用能力。
 
-#### 1C：Table semantics 和 ORDER BY 的详细范围
+#### 1C State Views：增量集合状态
 
-这里的“核心”包括单表元数据、分区内有序处理和更新流元数据。1C 计划包含：
+- 支持 `ProcessTableFunctionState.list_view()` 和 `map_view()`。
+- 回调中注入 state-backed `ListView` 和 `MapView`，操作直接访问 Flink keyed managed
+  state，不整体反序列化和写回集合。
+- 支持按状态独立 TTL、按 key 隔离、增删迭代，以及与 Value State 混用。
+- `clear_state()`、`clear_all_state()` 和 `clear_all()` 同时覆盖 Value State 和 Views。
+
+#### Phase 1 Exit Gate：最小恢复验证
+
+- 真实 Process Python worker 作业完成 checkpoint 后触发一次 TaskManager failover。
+- 验证 keyed Value State 连续、named Timer 恢复并只触发一次。
+- 验证短 TTL 的 Value State、`ListView` 和 `MapView` 过期后不可见。
+- 使用固定并行度和 HashMap backend，不扩展为生产矩阵。
+
+#### 1B Parity：Table semantics 和 ORDER BY 的详细范围
+
+这里的“核心”包括单表元数据、分区内有序处理和更新流元数据。1B 包含：
 
 | 子能力 | 目标行为 |
 |--------|----------|
@@ -532,13 +676,13 @@ def eval(self, ctx, event):
     time_column = semantics.time_column()
 ```
 
-`ORDER BY`、更新输入和更新输出属于 1C 中的独立能力，组合使用时继续遵守 Java
+`ORDER BY`、更新输入和更新输出属于 1B 中的独立能力，组合使用时继续遵守 Java
 PTF 的校验规则。例如，更新表不能使用 pass-through columns，接收或产出更新的 PTF
 不能使用 `on_time`。
 
-#### 1C：更新输入和输出的详细范围
+#### 1B Parity：更新输入和输出的详细范围
 
-1C 允许 Python PTF 消费和产出 changelog，不再把 operator 固定为 append-only。
+1B 允许 Python PTF 消费和产出 changelog，不再把 operator 固定为 append-only。
 目标行为与 Java PTF 一致：
 
 | 子能力 | 目标行为 |
@@ -563,8 +707,7 @@ PTF 的校验规则。例如，更新表不能使用 pass-through columns，接�
 `UPDATE_AFTER`。函数声明的 changelog mode 必须与实际产出的 `RowKind` 一致，否则下游
 物化结果可能不正确。
 
-下面的代码用于说明 1C 的目标语义。示例中的 `changelog_mode` 是拟议 API，当前 1A
-`udptf()` 尚不接受该参数。
+下面的代码说明当前固定 `changelog_mode` API 的使用语义。
 
 ##### Case A：消费 retract 输入，产出 append-only 审计流
 
@@ -694,14 +837,16 @@ result = events.partition_by(col("user_id")).process("retract_sum")
 +I[Alice, RESET, NULL]            ->      -D[Alice, 15]
 ```
 
-`ChangelogMode.all()` 告诉 planner 函数可能产出完整 retract changelog。函数实际产出的
-`RowKind` 必须属于声明的 mode；更新输出要求 Set semantics，upsert/retract 结果的 key
-必须与 `PARTITION BY` key 一致，并且不能使用 `on_time`。如果函数还声明消费更新输入，
+`ChangelogMode.all()` 告诉 planner 函数可能产出完整 retract changelog。Python operator
+会校验函数实际产出的 `RowKind` 是否属于声明 mode。upsert 输出没有 `UPDATE_BEFORE`，
+因此要求 Set semantics，且 upsert key 必须等于 `PARTITION BY` key；同一分区键只能维护
+一个当前逻辑结果。retract 输出通过 `UPDATE_BEFORE` 描述撤回，不要求 upsert key，也可
+用于 Row semantics。更新输出不能使用 `on_time`；如果函数还声明消费更新输入，
 `SUPPORT_UPDATES` 不能与 pass-through columns 组合。
 
 #### 完成阶段一后与 Java PTF 的剩余差异
 
-完成 1A、1B 和 1C 后，Python PTF 在单表场景中应已覆盖 Java PTF 的核心 table
+完成 1A、1B、1C 和 Exit Gate 后，Python PTF 在单表场景中应已覆盖 Java PTF 的核心 table
 semantics、`ORDER BY`、changelog、状态恢复和 Timer 语义。仍然存在以下差异：
 
 | 能力 | Java PTF | 完成阶段一后的 Python PTF | 后续安排 |
@@ -709,39 +854,63 @@ semantics、`ORDER BY`、changelog、状态恢复和 Timer 语义。仍然存在
 | 表输入数量 | 支持零表、单表和多表，默认最多 20 个表参数 | 仍要求恰好一个表参数 | 多表放在阶段二，零表放在阶段三 |
 | 零表/纯标量调用 | 可以通过 `fromCall()` 调用只含标量参数的 PTF | 不支持，因为当前 runtime 必须由表记录触发 `eval()` | 阶段三补充触发、并行度和 end-of-input 语义 |
 | 多表协调 | 支持多路输入、兼容分区键、每输入 watermark/排序缓冲和 Timer 协调 | 不支持 | 阶段二实现 |
-| 状态模型 | 支持 POJO/`Row` Value State、`ListView` 和 `MapView` | 只支持 `ROW` Value State | 阶段二实现 List/Map State；Python structured state object 放在阶段三评估 |
+| 状态模型 | 支持 POJO/`Row` Value State、`ListView` 和 `MapView` | 支持 `ROW` Value State、`ListView` 和 `MapView`，不支持任意 Python structured state object | Python structured state object 放在阶段三评估 |
 | 顶层结果类型 | 支持标量、`ROW` 和其他结构化结果 | 仍要求顶层 `ROW`，但字段可以使用现有 coder 支持的嵌套类型 | 阶段三支持标量、`ARRAY`、`MAP`、`RAW` 和动态结果类型 |
-| Changelog 推导 | `getChangelogMode(context)` 可以根据输入和下游要求动态选择 mode | 1C 首先支持固定 append/upsert/retract 声明 | 动态 planning context 放在阶段三评估 |
-| Table semantics context | Java context 暴露完整表语义 | 1C 暴露单表核心 metadata | 剩余高级 context API 放在阶段三补齐 |
+| Changelog 推导 | `getChangelogMode(context)` 可以根据输入和下游要求动态选择 mode | 1B 支持固定 append/upsert/retract 声明 | 动态 planning context 放在阶段三评估 |
+| Table semantics context | Java context 暴露完整表语义 | 1B 暴露单表核心 metadata | 剩余高级 context API 放在阶段三补齐 |
 | Inline 调用 | Java Table API 可以直接传入 PTF class，不要求先注册名称 | Python PTF 仍必须先注册名称 | 阶段三评估 inline Python PTF |
 | 可选参数 | Java 静态签名支持 optional scalar/table arguments | `udptf()` 中声明的业务参数全部必填 | 阶段三补齐 |
 | 高级类型推导 | 支持反射、`@DataTypeHint`、POJO/STRUCTURED/RAW 和覆盖 `getTypeInference()` | 使用显式 Python `DataType`，不承诺自定义 structured object、`RAW` 或动态输出 schema | 阶段三设计 Python API 和 coder |
 | Python 执行模式 | 不适用；Java PTF 直接在 JVM operator 中运行 | 仍只支持 Process Python worker | 阶段三评估 Embedded Python mode |
-| 查询演进验证 | Java PTF 支持通过稳定 UID 恢复兼容 schema 的状态 | 阶段一覆盖 checkpoint restore，但跨函数版本和 savepoint schema 演进仍需单独矩阵 | 持续生产化验证 |
+| 恢复验证矩阵 | Java PTF 已覆盖更广泛的 checkpoint/savepoint 和运行时组合 | Phase 1 只覆盖固定并行度、HashMap backend 的 checkpoint/failover/TTL 门禁 | Post-Phase-1 Hardening 补 savepoint、rescale、backend、压力和性能矩阵 |
 | 专用测试工具 | Java 提供 `ProcessTableFunctionTestHarness` | 主要依赖 Python 单元测试、planner/runtime 测试和端到端作业 | 可后续增加 Python PTF test harness |
 
 以下项目在完成阶段一后不应再视为差异：单表 Row/Set semantics、表参数 Trait、
 pass-through 约束、核心 `table_semantics_for()`、`ORDER BY`、append/upsert/retract 输入输出、
-0-N 条 `ROW` 输出、`ROW` Value State、事件时间 Timer、watermark、TTL、checkpoint restore、
+0-N 条 `ROW` 输出、`ROW` Value State、`ListView`、`MapView`、事件时间 Timer、watermark、TTL、checkpoint restore、
 注册名称的 Table API/SQL 调用，以及 Java PTF 互操作。
 
-### 第二阶段：扩展输入和状态模型
+### Post-Phase-1 Hardening：生产验证
 
-- 支持 Python 多表输入，包括多表参数投影、输入标识和单次 `eval()` 的空行占位语义。
+以下工作不作为 Phase 1 功能完成的退出条件：
+
+- savepoint、跨版本恢复和 schema evolution。
+- rescale 或修改并行度后的 keyed state、排序缓冲和 Timer 恢复。
+- HashMap、RocksDB 和 ForSt backend 矩阵。
+- 大 bundle、热点 key、背压、压力和长期运行。
+- 状态、排序和 Timer 密集场景的吞吐、延迟基线与性能门禁。
+- 函数重命名、稳定 UID 和函数升级兼容性的完整矩阵。
+
+### 第二阶段：扩展输入模型
+
+#### 2A Multi-input Core
+
+- 支持多个 append-only Python 表输入，包括表参数投影、输入标识和单次 `eval()` 的
+  `None` 占位语义。
 - 对齐 Java 多表约束：所有表参数使用 Set semantics，分区键类型兼容，并遵守默认
   20 个表参数的上限。
-- 支持多表 watermark、每输入排序缓冲、Timer 和 checkpoint 协调。
-- 支持多个更新流之间的 changelog 协商，并验证多表、更新输入、更新输出和
-  `ORDER BY` 组合时的 planner 与恢复语义。
+- 首个可运行版本支持 Value State，禁止 Timer、`ORDER BY` 和更新流。
+- 输出按表参数声明顺序附加每个表参数的分区列；即使多个输入的 key 值和类型相同，
+  schema 中也保留多组列。
+
+#### 2B Time Coordination
+
+- 支持每输入 watermark、idle/active 状态和输入结束。
+- 从所有 active 输入计算全局 watermark，并据此协调事件时间 Timer 和 checkpoint。
 - 明确跨输入到达顺序：运行时不承诺任意输入之间的先后关系；需要确定性的函数必须
   使用 watermark、Timer 或业务条件等待所需输入。
-- 支持 List State 和 Map State。
-- List State 和 Map State 使用 Flink keyed managed state，而不是仅保存在 Python worker
-  内存中；其修改必须参与 checkpoint，并在故障恢复后回到同一个 checkpoint 快照。
-- TTL 与 Java PTF 对齐：List State 的元素和 Map State 的 entry 独立过期，过期数据对
-  Python 回调不可见；TTL 仍基于处理时间，不触发 `on_timer()`。
-- 增加 List/Map State 的按 key 隔离、增删迭代、TTL 过期、checkpoint restore 和
-  state backend 兼容性测试。
+
+#### 2C Per-input ORDER BY
+
+- 为每个表参数维护独立排序缓冲和迟到数据判定。
+- 排序状态、每输入 watermark 进度和内部 Timer 参与 checkpoint/savepoint restore。
+
+#### 2D Multi-changelog
+
+- 协调多个更新输入的 changelog mode，按需 normalize 或 materialize update-before/full
+  delete，并推导 Python PTF 输出与下游需求。
+- 明确多输入输出前缀的列数量、顺序、重名规则、upsert key metadata 和 Python collector
+  编码，覆盖更新流与 `ORDER BY`、Timer、checkpoint 的组合。
 
 ### 第三阶段：低优先级完整对齐
 
@@ -815,10 +984,13 @@ Batch PTF、processing-time Timer 和 broadcast state 当前不是阶段一遗�
 1. Python public API、Java placeholder 和基础 Table API 调用。
 2. 核心 append-only runtime、Beam runner、Value State 和 Timer。
 3. `ORDER BY` 与 Java 排序缓冲接入。
-4. Changelog input，包括更新 Trait 和输入 `RowKind`。
-5. Changelog output，包括固定 mode 声明、输出 `RowKind` 和 planner 协商。
-6. 核心 `TableSemantics` context 与 proto。
-7. SQL、故障恢复、压力、性能和组合 E2E。
+4. 核心 `TableSemantics` context 与 proto。
+5. Changelog input/output，包括更新 Trait、固定 mode、`RowKind` 和 planner 协商。
+6. `ListView`、`MapView` 与 state-backed DataView 接入。
+7. SQL smoke、最小 checkpoint/failover/TTL 恢复门禁和 roadmap。
+
+savepoint、rescale、多 backend、压力和性能测试属于 Post-Phase-1 Hardening，应继续按测试
+主题拆分，不与 Exit Gate 合并。
 
 阶段用于表达用户能力和交付顺序，PR 用于控制 API、Planner、Runtime 和 worker 变更的
 审查风险。结论是：阶段可以合并，PR 不应合并。
@@ -835,18 +1007,26 @@ Batch PTF、processing-time Timer 和 broadcast state 当前不是阶段一遗�
 - JDK 17 构建、Python worker 测试、Java runner/timer 测试和 Table API
   端到端测试通过。
 
-### 1B Hardening
-
-- Value State 和 Timer 通过故障注入、checkpoint 和 savepoint restore 测试。
-- TTL、state backend、大 bundle、背压和 watermark/checkpoint 并发场景通过测试。
-- 建立可重复的状态访问和 Timer 性能基线。
-
-### 1C Parity
+### 1B Parity
 
 - 已注册 Python PTF 可以通过 Table API 和 SQL 调用。
 - `ORDER BY` 保证分区内顺序，晚到数据、watermark 和恢复语义与 Java PTF 一致。
-- 排序缓冲通过 checkpoint/savepoint restore、背压和大分区测试，并建立性能基线。
+- 排序缓冲、watermark 进度和内部 Timer 参与 checkpoint，基础 snapshot restore 通过。
 - `table_semantics_for()` 返回单表核心类型、分区、排序、时间和 changelog metadata。
 - 更新输入保留 `+I/-U/+U/-D`，并正确执行 update-before 和 full-delete 要求。
 - Python PTF 可以声明并产出固定 append、upsert 或 retract changelog。
-- 更新输入输出与状态、checkpoint、下游 retract/upsert sink 的组合测试通过。
+- operator 拒绝声明 mode 之外的输出，并覆盖 Java planner 的主要非法组合。
+
+### 1C State Views
+
+- `ListView` 支持 `get/add/add_all/remove/clear`。
+- `MapView` 支持 `get/put/remove/contains`、迭代和 clear。
+- View 直接访问 keyed managed state，按 key 隔离并支持独立 TTL。
+- Value State、`ListView` 和 `MapView` 可以混用，并受 context 清理 API 统一控制。
+
+### Phase 1 Exit Gate
+
+- 使用真实 Process Python worker 完成 checkpoint 后触发一次 TaskManager failover。
+- 恢复后 keyed Value State 计数连续，named Timer 恢复且只触发一次。
+- 短 TTL 的 Value State、`ListView` 和 `MapView` 过期后不可见。
+- 使用固定并行度和 HashMap backend；Post-Phase-1 Hardening 项不阻塞 Phase 1 退出。

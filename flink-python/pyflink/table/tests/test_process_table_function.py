@@ -114,6 +114,18 @@ class TrackStateViews(ProcessTableFunction):
                   counts.get(event.value) or 0)
 
 
+class ObserveExpiringState(ProcessTableFunction):
+    def eval(self, ctx, memory, history, counts, event):
+        previous_count = memory.count or 0
+        previous_history = len(list(history.get()))
+        previous_map_value = counts.get("seen") or 0
+
+        memory["count"] = previous_count + 1
+        history.add(event.sequence_id)
+        counts.put("seen", previous_map_value + 1)
+        yield Row(event.sequence_id, previous_count, previous_history, previous_map_value)
+
+
 class ProcessTableFunctionTests(PyFlinkTestCase):
 
     @staticmethod
@@ -275,6 +287,60 @@ class ProcessTableFunctionTests(PyFlinkTestCase):
             (6, 2, 0, 0),
         ], actual)
 
+    def test_value_state_and_state_views_expire(self):
+        table_env = TableEnvironment.create(EnvironmentSettings.in_streaming_mode())
+        table_env.get_config().set("python.fn-execution.bundle.size", "1")
+        table_env.get_config().set("python.state.cache-size", "0")
+        table_env.get_config().set("python.map-state.read-cache-size", "0")
+        table_env.get_config().set("python.map-state.write-cache-size", "0")
+        table_env.get_config().set("parallelism.default", "1")
+        ttl = Duration.of_millis(100)
+        function = udptf(
+            ObserveExpiringState(),
+            arguments=[ProcessTableFunctionArgument.table(
+                "event", traits={Trait.SET_SEMANTIC_TABLE})],
+            states=[
+                ProcessTableFunctionState.value(
+                    "memory",
+                    DataTypes.ROW([DataTypes.FIELD("count", DataTypes.BIGINT())]),
+                    ttl=ttl),
+                ProcessTableFunctionState.list_view(
+                    "history", DataTypes.BIGINT(), ttl=ttl),
+                ProcessTableFunctionState.map_view(
+                    "counts", DataTypes.STRING(), DataTypes.BIGINT(), ttl=ttl),
+            ],
+            result_type=DataTypes.ROW([
+                DataTypes.FIELD("sequence", DataTypes.BIGINT()),
+                DataTypes.FIELD("previous_count", DataTypes.BIGINT()),
+                DataTypes.FIELD("previous_history", DataTypes.INT()),
+                DataTypes.FIELD("previous_map_value", DataTypes.BIGINT()),
+            ]),
+        )
+        table_env.create_temporary_system_function("observe_expiring_state", function)
+        table_env.execute_sql("""
+            CREATE TEMPORARY TABLE ttl_events (
+                user_id AS CAST(1 AS BIGINT),
+                sequence_id BIGINT
+            ) WITH (
+                'connector' = 'datagen',
+                'number-of-rows' = '12',
+                'rows-per-second' = '1',
+                'scan.parallelism' = '1',
+                'fields.sequence_id.kind' = 'sequence',
+                'fields.sequence_id.start' = '1',
+                'fields.sequence_id.end' = '12'
+            )
+        """)
+
+        result = table_env.from_path("ttl_events").partition_by(
+            col("user_id")).process("observe_expiring_state")
+        with result.execute().collect() as rows:
+            actual = {row[1]: (row[2], row[3], row[4]) for row in rows}
+
+        self.assertEqual(set(range(1, 13)), set(actual))
+        self.assertEqual((0, 0, 0), actual[1])
+        self.assertEqual((0, 0, 0), actual[12])
+
     def test_table_process_and_from_call_plan(self):
         table_env = TableEnvironment.create(EnvironmentSettings.in_streaming_mode())
         table_env.create_temporary_system_function("tokenize", self._tokenize_function())
@@ -295,6 +361,23 @@ class ProcessTableFunctionTests(PyFlinkTestCase):
                          explicit_result.get_schema().get_field_names())
         self.assertIn("ProcessTableFunction", implicit_result.explain())
         self.assertIn("ProcessTableFunction", explicit_result.explain())
+
+    def test_registered_function_can_be_called_from_sql(self):
+        table_env = TableEnvironment.create(EnvironmentSettings.in_streaming_mode())
+        table_env.get_config().set("python.fn-execution.bundle.size", "1")
+        table_env.create_temporary_system_function("tokenize", self._tokenize_function())
+        table_env.create_temporary_view(
+            "events",
+            table_env.from_elements(
+                [("hello flink",)],
+                DataTypes.ROW([DataTypes.FIELD("text", DataTypes.STRING())])))
+
+        result = table_env.sql_query(
+            "SELECT * FROM tokenize(event => TABLE events, `separator` => ' ')")
+        with result.execute().collect() as rows:
+            actual = sorted((row[0], row[1]) for row in rows)
+
+        self.assertEqual([("flink", " "), ("hello", " ")], actual)
 
     def test_call_java_process_table_functions(self):
         table_env = TableEnvironment.create(EnvironmentSettings.in_streaming_mode())
