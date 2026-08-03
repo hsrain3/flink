@@ -16,6 +16,7 @@
 # limitations under the License.
 ################################################################################
 from pyflink.java_gateway import get_gateway
+from pyflink.common import RowKind
 from pyflink.util.api_stability_decorators import PublicEvolving
 
 __all__ = ['ChangelogMode']
@@ -29,6 +30,15 @@ class ChangelogMode(object):
 
     def __init__(self, j_changelog_mode):
         self._j_changelog_mode = j_changelog_mode
+        self._contained_kinds = None
+        self._key_only_deletes = None
+
+    @staticmethod
+    def _from_python(contained_kinds, key_only_deletes=False):
+        mode = ChangelogMode(None)
+        mode._contained_kinds = frozenset(contained_kinds)
+        mode._key_only_deletes = key_only_deletes
+        return mode
 
     @staticmethod
     def insert_only():
@@ -57,3 +67,26 @@ class ChangelogMode(object):
         gateway = get_gateway()
         return ChangelogMode(
             gateway.jvm.org.apache.flink.table.connector.ChangelogMode.all())
+
+    def get_contained_kinds(self):
+        """Returns the row kinds contained in this changelog mode."""
+        if self._contained_kinds is None:
+            self._contained_kinds = frozenset(
+                RowKind[kind.name()] for kind in self._j_changelog_mode.getContainedKinds())
+        return frozenset(self._contained_kinds)
+
+    def contains(self, row_kind: RowKind) -> bool:
+        """Returns whether this changelog mode contains the given row kind."""
+        if not isinstance(row_kind, RowKind):
+            raise TypeError("row_kind must be a pyflink.common.RowKind.")
+        return row_kind in self.get_contained_kinds()
+
+    def contains_only(self, row_kind: RowKind) -> bool:
+        """Returns whether this changelog contains only the given row kind."""
+        return self.contains(row_kind) and len(self.get_contained_kinds()) == 1
+
+    def key_only_deletes(self) -> bool:
+        """Returns whether delete rows contain only key columns."""
+        if self._key_only_deletes is None:
+            self._key_only_deletes = self._j_changelog_mode.keyOnlyDeletes()
+        return self._key_only_deletes

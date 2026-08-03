@@ -17,12 +17,17 @@
 ################################################################################
 import datetime
 
-from pyflink.common import Instant, Row, Time
+from pyflink.common import Instant, Row, RowKind, Time
 from pyflink.datastream.state import StateTtlConfig
 from pyflink.fn_execution import pickle
-from pyflink.fn_execution.coders import from_proto
+from pyflink.fn_execution.coders import LengthPrefixBaseCoder, from_proto
 from pyflink.fn_execution.table.operations import BaseOperation
 from pyflink.fn_execution.utils.operation_utils import normalize_table_function_result
+from pyflink.table.changelog_mode import ChangelogMode
+from pyflink.table.udf import (
+    ProcessTableFunctionSortDirection,
+    ProcessTableFunctionTableSemantics,
+)
 
 
 PROCESS_TABLE_FUNCTION_URN = "flink:transform:process_table_function:v1"
@@ -33,6 +38,26 @@ DELETE_ANONYMOUS = 2
 DELETE_NAMED = 3
 CLEAR_ALL = 4
 TRIGGER = 5
+
+
+def _to_changelog_mode(changelog_mode_proto):
+    kinds = [RowKind(kind) for kind in changelog_mode_proto.contained_kinds]
+    if not kinds:
+        kinds = [RowKind.INSERT]
+    return ChangelogMode._from_python(kinds, changelog_mode_proto.key_only_deletes)
+
+
+def _to_table_semantics(table_semantics_proto):
+    directions = tuple(tuple(ProcessTableFunctionSortDirection)[direction]
+                       for direction in table_semantics_proto.order_by_directions)
+    return ProcessTableFunctionTableSemantics(
+        LengthPrefixBaseCoder._to_data_type(table_semantics_proto.data_type),
+        table_semantics_proto.partition_by_columns,
+        table_semantics_proto.order_by_columns,
+        directions,
+        table_semantics_proto.time_column,
+        _to_changelog_mode(table_semantics_proto.changelog_mode),
+        [key.columns for key in table_semantics_proto.upsert_keys])
 
 
 def _state_key(key):
@@ -137,9 +162,12 @@ class _ProcessTableTimeContext(object):
 
 class _ProcessTableFunctionContext(object):
 
-    def __init__(self, timer_emitter, state_names=None):
+    def __init__(self, timer_emitter, state_names=None, table_semantics=None,
+                 changelog_mode=None):
         self._timer_emitter = timer_emitter
         self._state_names = None if state_names is None else frozenset(state_names)
+        self._table_semantics = dict(table_semantics or {})
+        self._changelog_mode = changelog_mode or ChangelogMode._from_python([RowKind.INSERT])
         self._cleared_states = set()
         self._time = None
         self._table_watermark = None
@@ -155,6 +183,15 @@ class _ProcessTableFunctionContext(object):
 
     def time_context(self, conversion_type):
         return _ProcessTableTimeContext(self, conversion_type)
+
+    def table_semantics_for(self, argument_name):
+        try:
+            return self._table_semantics[argument_name]
+        except KeyError:
+            raise ValueError("Unknown table argument: %s" % argument_name)
+
+    def get_changelog_mode(self):
+        return self._changelog_mode
 
     def clear_state(self, name):
         if self._state_names is not None and name not in self._state_names:
@@ -183,8 +220,15 @@ class ProcessTableFunctionOperation(BaseOperation):
         self._state_specs = list(serialized_fn.states)
         self._state_handles = []
         self._timer_emitter = _TimerCommandEmitter(keyed_state_backend)
+        table_semantics = {
+            semantics.argument_name: _to_table_semantics(semantics)
+            for semantics in serialized_fn.table_semantics
+        }
         self._context = _ProcessTableFunctionContext(
-            self._timer_emitter, [state.name for state in self._state_specs])
+            self._timer_emitter,
+            [state.name for state in self._state_specs],
+            table_semantics,
+            _to_changelog_mode(serialized_fn.changelog_mode))
         super(ProcessTableFunctionOperation, self).__init__(serialized_fn)
 
     def generate_func(self, serialized_fn):

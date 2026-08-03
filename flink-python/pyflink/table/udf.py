@@ -31,7 +31,8 @@ from pyflink.util.api_stability_decorators import PublicEvolving, Internal
 __all__ = ['FunctionContext', 'AggregateFunction', 'ScalarFunction', 'TableFunction',
            'TableAggregateFunction', 'AsyncScalarFunction', 'ProcessTableFunction',
            'ProcessTableFunctionArgument', 'ProcessTableFunctionState',
-           'ProcessTableFunctionArgumentTrait', 'udf', 'udtf', 'udptf', 'udaf', 'udtaf']
+           'ProcessTableFunctionArgumentTrait', 'ProcessTableFunctionTableSemantics',
+           'ProcessTableFunctionSortDirection', 'udf', 'udtf', 'udptf', 'udaf', 'udtaf']
 
 
 @PublicEvolving()
@@ -272,6 +273,71 @@ class ProcessTableFunctionArgumentTrait(enum.Enum):
     OPTIONAL_PARTITION_BY = 'OPTIONAL_PARTITION_BY'
     REQUIRE_UPDATE_BEFORE = 'REQUIRE_UPDATE_BEFORE'
     REQUIRE_FULL_DELETE = 'REQUIRE_FULL_DELETE'
+
+
+@PublicEvolving()
+class ProcessTableFunctionSortDirection(enum.Enum):
+    """Sort direction for an ``ORDER BY`` column of a PTF table argument."""
+
+    ASC_NULLS_FIRST = 'ASC_NULLS_FIRST'
+    ASC_NULLS_LAST = 'ASC_NULLS_LAST'
+    DESC_NULLS_FIRST = 'DESC_NULLS_FIRST'
+    DESC_NULLS_LAST = 'DESC_NULLS_LAST'
+
+    def is_descending(self) -> bool:
+        """Returns whether the direction is descending."""
+        return self in (self.DESC_NULLS_FIRST, self.DESC_NULLS_LAST)
+
+    def is_nulls_first(self) -> bool:
+        """Returns whether null values are sorted first."""
+        return self in (self.ASC_NULLS_FIRST, self.DESC_NULLS_FIRST)
+
+    def is_nulls_last(self) -> bool:
+        """Returns whether null values are sorted last."""
+        return not self.is_nulls_first()
+
+
+@PublicEvolving()
+class ProcessTableFunctionTableSemantics(object):
+    """Runtime metadata for a table argument of a process table function."""
+
+    def __init__(self, data_type, partition_by_columns, order_by_columns,
+                 order_by_directions, time_column, changelog_mode, upsert_key_columns):
+        self._data_type = data_type
+        self._partition_by_columns = tuple(partition_by_columns)
+        self._order_by_columns = tuple(order_by_columns)
+        self._order_by_directions = tuple(order_by_directions)
+        self._time_column = time_column
+        self._changelog_mode = changelog_mode
+        self._upsert_key_columns = tuple(tuple(key) for key in upsert_key_columns)
+
+    def data_type(self):
+        """Returns the actual data type of the table argument."""
+        return self._data_type
+
+    def partition_by_columns(self):
+        """Returns the 0-based ``PARTITION BY`` column indexes."""
+        return self._partition_by_columns
+
+    def order_by_columns(self):
+        """Returns the 0-based ``ORDER BY`` column indexes."""
+        return self._order_by_columns
+
+    def order_by_directions(self):
+        """Returns the sort direction for each ``ORDER BY`` column."""
+        return self._order_by_directions
+
+    def time_column(self):
+        """Returns the 0-based ``on_time`` column index, or ``-1`` if absent."""
+        return self._time_column
+
+    def changelog_mode(self):
+        """Returns the changelog mode consumed for the table argument."""
+        return self._changelog_mode
+
+    def upsert_key_columns(self):
+        """Returns the candidate upsert keys as immutable tuples of column indexes."""
+        return self._upsert_key_columns
 
 
 @PublicEvolving()

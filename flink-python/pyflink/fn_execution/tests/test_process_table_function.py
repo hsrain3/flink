@@ -20,7 +20,8 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from pyflink.common import Instant, Row
+from pyflink.common import Instant, Row, RowKind
+from pyflink.fn_execution import flink_fn_execution_pb2
 from pyflink.fn_execution.table.process_table_function import (
     CLEAR_ALL,
     DELETE_ANONYMOUS,
@@ -30,7 +31,10 @@ from pyflink.fn_execution.table.process_table_function import (
     TRIGGER,
     ProcessTableFunctionOperation,
     _ProcessTableFunctionContext,
+    _to_changelog_mode,
+    _to_table_semantics,
 )
+from pyflink.table.udf import ProcessTableFunctionSortDirection
 
 
 class _StateHandle(object):
@@ -279,6 +283,75 @@ class ProcessTableFunctionTimeContextTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "UTC-naive"):
             self.context.time_context(datetime.datetime).register_on_time(
                 datetime.datetime.now(datetime.timezone.utc))
+
+
+class ProcessTableFunctionTableSemanticsTests(unittest.TestCase):
+
+    @staticmethod
+    def _semantics_proto():
+        ptf = flink_fn_execution_pb2.UserDefinedProcessTableFunction()
+        semantics = ptf.table_semantics.add()
+        semantics.argument_name = "event"
+        semantics.data_type.type_name = flink_fn_execution_pb2.Schema.ROW
+        field = semantics.data_type.row_schema.fields.add()
+        field.name = "user_id"
+        field.type.type_name = flink_fn_execution_pb2.Schema.VARCHAR
+        field.type.var_char_info.length = 20
+        semantics.partition_by_columns.extend([0])
+        semantics.order_by_columns.extend([2, 1])
+        semantics.order_by_directions.extend([
+            flink_fn_execution_pb2.UserDefinedProcessTableFunction.TableSemantics.ASC_NULLS_LAST,
+            flink_fn_execution_pb2.UserDefinedProcessTableFunction.TableSemantics
+            .DESC_NULLS_FIRST,
+        ])
+        semantics.time_column = 2
+        semantics.changelog_mode.contained_kinds.extend([
+            flink_fn_execution_pb2.UserDefinedProcessTableFunction.INSERT,
+            flink_fn_execution_pb2.UserDefinedProcessTableFunction.UPDATE_AFTER,
+            flink_fn_execution_pb2.UserDefinedProcessTableFunction.DELETE,
+        ])
+        semantics.changelog_mode.key_only_deletes = True
+        semantics.upsert_keys.add().columns.extend([0])
+        return semantics
+
+    def test_table_semantics_metadata_is_exposed_as_immutable_values(self):
+        semantics = _to_table_semantics(self._semantics_proto())
+        output_mode_proto = flink_fn_execution_pb2.UserDefinedProcessTableFunction.ChangelogMode()
+        output_mode_proto.contained_kinds.append(
+            flink_fn_execution_pb2.UserDefinedProcessTableFunction.INSERT)
+        context = _ProcessTableFunctionContext(
+            _TimerEmitter(),
+            table_semantics={"event": semantics},
+            changelog_mode=_to_changelog_mode(output_mode_proto))
+
+        actual = context.table_semantics_for("event")
+        self.assertEqual(["user_id"], actual.data_type().field_names())
+        self.assertEqual((0,), actual.partition_by_columns())
+        self.assertEqual((2, 1), actual.order_by_columns())
+        self.assertEqual(
+            (ProcessTableFunctionSortDirection.ASC_NULLS_LAST,
+             ProcessTableFunctionSortDirection.DESC_NULLS_FIRST),
+            actual.order_by_directions())
+        self.assertEqual(2, actual.time_column())
+        self.assertEqual(((0,),), actual.upsert_key_columns())
+        self.assertEqual(
+            frozenset({RowKind.INSERT, RowKind.UPDATE_AFTER, RowKind.DELETE}),
+            actual.changelog_mode().get_contained_kinds())
+        self.assertTrue(actual.changelog_mode().key_only_deletes())
+        self.assertTrue(context.get_changelog_mode().contains_only(RowKind.INSERT))
+
+    def test_unknown_table_argument_is_rejected(self):
+        context = _ProcessTableFunctionContext(_TimerEmitter())
+
+        with self.assertRaisesRegex(ValueError, "Unknown table argument: missing"):
+            context.table_semantics_for("missing")
+
+    def test_sort_direction_queries(self):
+        direction = ProcessTableFunctionSortDirection.DESC_NULLS_LAST
+
+        self.assertTrue(direction.is_descending())
+        self.assertFalse(direction.is_nulls_first())
+        self.assertTrue(direction.is_nulls_last())
 
 
 if __name__ == '__main__':

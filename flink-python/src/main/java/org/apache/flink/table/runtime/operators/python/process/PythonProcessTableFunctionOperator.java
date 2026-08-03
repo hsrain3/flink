@@ -42,6 +42,7 @@ import org.apache.flink.streaming.api.operators.Triggerable;
 import org.apache.flink.streaming.api.watermark.Watermark;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.flink.table.api.TableRuntimeException;
+import org.apache.flink.table.connector.ChangelogMode;
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.data.StringData;
@@ -56,6 +57,7 @@ import org.apache.flink.table.runtime.generated.GeneratedRecordComparator;
 import org.apache.flink.table.runtime.generated.Projection;
 import org.apache.flink.table.runtime.generated.RecordComparator;
 import org.apache.flink.table.runtime.operators.process.InputSortBuffer;
+import org.apache.flink.table.runtime.operators.process.RuntimeChangelogMode;
 import org.apache.flink.table.runtime.operators.process.RuntimeStateInfo;
 import org.apache.flink.table.runtime.operators.process.RuntimeTableSemantics;
 import org.apache.flink.table.runtime.operators.process.WritableInternalTimeContext;
@@ -106,6 +108,7 @@ public final class PythonProcessTableFunctionOperator
 
     private final PythonProcessTableFunction function;
     private final RuntimeTableSemantics tableSemantics;
+    private final RuntimeChangelogMode producedChangelogMode;
     private final List<RuntimeStateInfo> stateInfos;
     private final RowType inputType;
     private final RowType argumentType;
@@ -147,6 +150,7 @@ public final class PythonProcessTableFunctionOperator
             Configuration config,
             PythonProcessTableFunction function,
             RuntimeTableSemantics tableSemantics,
+            RuntimeChangelogMode producedChangelogMode,
             List<RuntimeStateInfo> stateInfos,
             RowType inputType,
             RowType argumentType,
@@ -158,6 +162,7 @@ public final class PythonProcessTableFunctionOperator
         super(config);
         this.function = function;
         this.tableSemantics = tableSemantics;
+        this.producedChangelogMode = producedChangelogMode;
         this.stateInfos = stateInfos;
         this.inputType = inputType;
         this.argumentType = argumentType;
@@ -511,6 +516,8 @@ public final class PythonProcessTableFunctionOperator
         if (tableSemantics.hasSetSemantics()) {
             builder.setKeyType(PythonTypeUtils.toProtoType(keyType));
         }
+        builder.addTableSemantics(createTableSemanticsProto());
+        setChangelogMode(builder.getChangelogModeBuilder(), producedChangelogMode.deserialize());
         final String[] names = function.getArgumentNames();
         final boolean[] tables = function.getTableArguments();
         final String[] traits = function.getArgumentTraits();
@@ -557,6 +564,51 @@ public final class PythonProcessTableFunctionOperator
                         .setAttemptNumber(getRuntimeContext().getTaskInfo().getAttemptNumber())
                         .build());
         return builder.build();
+    }
+
+    private FlinkFnApi.UserDefinedProcessTableFunction.TableSemantics createTableSemanticsProto() {
+        final FlinkFnApi.UserDefinedProcessTableFunction.TableSemantics.Builder builder =
+                FlinkFnApi.UserDefinedProcessTableFunction.TableSemantics.newBuilder()
+                        .setArgumentName(tableSemantics.getArgName())
+                        .setDataType(
+                                PythonTypeUtils.toProtoType(
+                                        tableSemantics.dataType().getLogicalType()))
+                        .addAllPartitionByColumns(
+                                Arrays.stream(tableSemantics.partitionByColumns())
+                                        .boxed()
+                                        .collect(Collectors.toList()))
+                        .addAllOrderByColumns(
+                                Arrays.stream(tableSemantics.orderByColumns())
+                                        .boxed()
+                                        .collect(Collectors.toList()))
+                        .setTimeColumn(tableSemantics.timeColumn());
+        for (org.apache.flink.table.functions.TableSemantics.SortDirection direction :
+                tableSemantics.orderByDirections()) {
+            builder.addOrderByDirections(
+                    FlinkFnApi.UserDefinedProcessTableFunction.TableSemantics.SortDirection.valueOf(
+                            direction.name()));
+        }
+        setChangelogMode(builder.getChangelogModeBuilder(), tableSemantics.getChangelogMode());
+        for (int[] key : tableSemantics.upsertKeyColumns()) {
+            builder.addUpsertKeys(
+                    FlinkFnApi.UserDefinedProcessTableFunction.TableSemantics.UpsertKey.newBuilder()
+                            .addAllColumns(
+                                    Arrays.stream(key).boxed().collect(Collectors.toList())));
+        }
+        return builder.build();
+    }
+
+    private static void setChangelogMode(
+            FlinkFnApi.UserDefinedProcessTableFunction.ChangelogMode.Builder builder,
+            ChangelogMode changelogMode) {
+        builder.setKeyOnlyDeletes(changelogMode.keyOnlyDeletes());
+        changelogMode
+                .getContainedKinds()
+                .forEach(
+                        kind ->
+                                builder.addContainedKinds(
+                                        FlinkFnApi.UserDefinedProcessTableFunction.ChangelogKind
+                                                .valueOf(kind.name())));
     }
 
     private static final class Invocation {

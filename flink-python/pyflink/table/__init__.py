@@ -137,7 +137,8 @@ from pyflink.table.table_schema import TableSchema
 from pyflink.table.types import DataTypes, UserDefinedType, Row, RowKind
 from pyflink.table.udf import FunctionContext, ScalarFunction, TableFunction, AggregateFunction, \
     TableAggregateFunction, AsyncScalarFunction, ProcessTableFunction, \
-    ProcessTableFunctionArgument, ProcessTableFunctionArgumentTrait, ProcessTableFunctionState
+    ProcessTableFunctionArgument, ProcessTableFunctionArgumentTrait, ProcessTableFunctionState, \
+    ProcessTableFunctionSortDirection, ProcessTableFunctionTableSemantics
 
 __all__ = [
     'TableEnvironment',
@@ -160,6 +161,8 @@ __all__ = [
     'ProcessTableFunctionArgument',
     'ProcessTableFunctionArgumentTrait',
     'ProcessTableFunctionState',
+    'ProcessTableFunctionSortDirection',
+    'ProcessTableFunctionTableSemantics',
     'FunctionContext',
     'DataView',
     'ListView',

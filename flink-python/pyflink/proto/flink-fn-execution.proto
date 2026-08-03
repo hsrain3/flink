@@ -89,6 +89,40 @@ message UserDefinedFunctions {
 
 // A Python user-defined process table function and its explicit runtime contract.
 message UserDefinedProcessTableFunction {
+  enum ChangelogKind {
+    INSERT = 0;
+    UPDATE_BEFORE = 1;
+    UPDATE_AFTER = 2;
+    DELETE = 3;
+  }
+
+  message ChangelogMode {
+    repeated ChangelogKind contained_kinds = 1;
+    bool key_only_deletes = 2;
+  }
+
+  message TableSemantics {
+    enum SortDirection {
+      ASC_NULLS_FIRST = 0;
+      ASC_NULLS_LAST = 1;
+      DESC_NULLS_FIRST = 2;
+      DESC_NULLS_LAST = 3;
+    }
+
+    message UpsertKey {
+      repeated int32 columns = 1;
+    }
+
+    string argument_name = 1;
+    Schema.FieldType data_type = 2;
+    repeated int32 partition_by_columns = 3;
+    repeated int32 order_by_columns = 4;
+    repeated SortDirection order_by_directions = 5;
+    int32 time_column = 6;
+    ChangelogMode changelog_mode = 7;
+    repeated UpsertKey upsert_keys = 8;
+  }
+
   message Argument {
     string name = 1;
     Schema.FieldType type = 2;
@@ -114,6 +148,8 @@ message UserDefinedProcessTableFunction {
   int32 map_state_write_cache_size = 10;
   repeated JobParameter job_parameters = 11;
   UserDefinedDataStreamFunction.RuntimeContext runtime_context = 12;
+  repeated TableSemantics table_semantics = 13;
+  ChangelogMode changelog_mode = 14;
 }
 
 // Used to describe the info of over window in pandas batch over window aggregation

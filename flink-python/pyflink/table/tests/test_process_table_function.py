@@ -16,7 +16,7 @@
 # limitations under the License.
 ################################################################################
 
-from pyflink.common import Duration, Row
+from pyflink.common import Duration, Row, RowKind
 from pyflink.table import DataTypes, EnvironmentSettings, TableEnvironment
 from pyflink.table.expressions import col, descriptor, lit
 from pyflink.table.udf import (
@@ -72,6 +72,15 @@ class PassThroughLength(ProcessTableFunction):
 class OrderedScores(ProcessTableFunction):
     def eval(self, ctx, event):
         yield Row(event.score)
+
+
+class InspectTableSemantics(ProcessTableFunction):
+    def eval(self, ctx, event):
+        semantics = ctx.table_semantics_for("event")
+        yield Row(
+            len(semantics.data_type().field_names()),
+            semantics.partition_by_columns()[0],
+            ctx.get_changelog_mode().contains_only(RowKind.INSERT))
 
 
 class ProcessTableFunctionTests(PyFlinkTestCase):
@@ -280,6 +289,32 @@ class ProcessTableFunctionTests(PyFlinkTestCase):
         self.assertIn("ProcessTableFunction", plan)
         self.assertIn("ORDER BY", plan)
         self.assertIn("DESC", plan)
+
+    def test_table_semantics_execution(self):
+        table_env = TableEnvironment.create(EnvironmentSettings.in_streaming_mode())
+        table_env.get_config().set("python.fn-execution.bundle.size", "1")
+        function = udptf(
+            InspectTableSemantics(),
+            arguments=[ProcessTableFunctionArgument.table(
+                "event", traits={Trait.SET_SEMANTIC_TABLE})],
+            result_type=DataTypes.ROW([
+                DataTypes.FIELD("field_count", DataTypes.INT()),
+                DataTypes.FIELD("partition_column", DataTypes.INT()),
+                DataTypes.FIELD("insert_only", DataTypes.BOOLEAN()),
+            ]),
+        )
+        table_env.create_temporary_system_function("inspect_semantics", function)
+        events = table_env.from_elements(
+            [(7, "flink")],
+            DataTypes.ROW([
+                DataTypes.FIELD("user_id", DataTypes.BIGINT()),
+                DataTypes.FIELD("value", DataTypes.STRING()),
+            ]))
+
+        result = events.partition_by(col("user_id")).process("inspect_semantics")
+
+        with result.execute().collect() as rows:
+            self.assertEqual([Row(7, 2, 0, True)], list(rows))
 
     def test_stateful_named_timer_execution(self):
         table_env = TableEnvironment.create(EnvironmentSettings.in_streaming_mode())

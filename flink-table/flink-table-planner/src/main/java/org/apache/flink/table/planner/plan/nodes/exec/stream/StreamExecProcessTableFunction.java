@@ -348,6 +348,8 @@ public class StreamExecProcessTableFunction extends ExecNodeBase<RowData>
                     "Python process table functions support exactly one table input.");
         }
         final RuntimeTableSemantics semantics = runtimeTableSemantics.get(0);
+        final RuntimeChangelogMode producedChangelogMode =
+                RuntimeChangelogMode.serialize(outputChangelogMode);
         if (function.hasOnTimer() && semantics.passColumnsThrough()) {
             throw new TableException(
                     "Python process table function timers do not support pass-through columns.");
@@ -398,6 +400,7 @@ public class StreamExecProcessTableFunction extends ExecNodeBase<RowData>
                         pythonConfig,
                         function,
                         semantics,
+                        producedChangelogMode,
                         runtimeStateInfos,
                         inputType,
                         projectionResult.getArgumentType(),
@@ -446,6 +449,7 @@ public class StreamExecProcessTableFunction extends ExecNodeBase<RowData>
             Configuration pythonConfig,
             PythonProcessTableFunction function,
             RuntimeTableSemantics semantics,
+            RuntimeChangelogMode producedChangelogMode,
             List<RuntimeStateInfo> stateInfos,
             RowType inputType,
             RowType argumentType,
@@ -464,6 +468,7 @@ public class StreamExecProcessTableFunction extends ExecNodeBase<RowData>
                             Configuration.class,
                             PythonProcessTableFunction.class,
                             RuntimeTableSemantics.class,
+                            RuntimeChangelogMode.class,
                             List.class,
                             RowType.class,
                             RowType.class,
@@ -477,6 +482,7 @@ public class StreamExecProcessTableFunction extends ExecNodeBase<RowData>
                             pythonConfig,
                             function,
                             semantics,
+                            producedChangelogMode,
                             stateInfos,
                             inputType,
                             argumentType,
