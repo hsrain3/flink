@@ -42,6 +42,8 @@ import org.apache.flink.streaming.api.operators.Triggerable;
 import org.apache.flink.streaming.api.watermark.Watermark;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.flink.table.api.TableRuntimeException;
+import org.apache.flink.table.api.dataview.ListView;
+import org.apache.flink.table.api.dataview.MapView;
 import org.apache.flink.table.connector.ChangelogMode;
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
@@ -52,6 +54,7 @@ import org.apache.flink.table.data.utils.JoinedRowData;
 import org.apache.flink.table.functions.ProcessTableFunction;
 import org.apache.flink.table.functions.python.PythonEnv;
 import org.apache.flink.table.functions.python.PythonProcessTableFunction;
+import org.apache.flink.table.runtime.dataview.DataViewUtils;
 import org.apache.flink.table.runtime.generated.GeneratedProjection;
 import org.apache.flink.table.runtime.generated.GeneratedRecordComparator;
 import org.apache.flink.table.runtime.generated.Projection;
@@ -67,6 +70,9 @@ import org.apache.flink.table.runtime.runners.python.beam.BeamProcessTableFuncti
 import org.apache.flink.table.runtime.typeutils.PythonTypeUtils;
 import org.apache.flink.table.runtime.typeutils.RowDataSerializer;
 import org.apache.flink.table.runtime.typeutils.StringDataSerializer;
+import org.apache.flink.table.types.CollectionDataType;
+import org.apache.flink.table.types.DataType;
+import org.apache.flink.table.types.KeyValueDataType;
 import org.apache.flink.table.types.logical.BigIntType;
 import org.apache.flink.table.types.logical.LocalZonedTimestampType;
 import org.apache.flink.table.types.logical.LogicalType;
@@ -540,13 +546,37 @@ public final class PythonProcessTableFunctionOperator
             builder.addArguments(argument);
         }
         for (RuntimeStateInfo stateInfo : stateInfos) {
-            builder.addStates(
+            final FlinkFnApi.UserDefinedProcessTableFunction.State.Builder stateBuilder =
                     FlinkFnApi.UserDefinedProcessTableFunction.State.newBuilder()
                             .setName(stateInfo.getStateName())
-                            .setType(
-                                    PythonTypeUtils.toProtoType(
-                                            stateInfo.getDataType().getLogicalType()))
-                            .setTtlMillis(stateInfo.getTimeToLive()));
+                            .setTtlMillis(stateInfo.getTimeToLive());
+            final DataType dataType = stateInfo.getDataType();
+            final LogicalType logicalType = dataType.getLogicalType();
+            if (DataViewUtils.isDataView(logicalType, ListView.class)) {
+                final CollectionDataType arrayDataType =
+                        (CollectionDataType) dataType.getChildren().get(0);
+                stateBuilder.setListView(
+                        FlinkFnApi.UserDefinedProcessTableFunction.State.ListView.newBuilder()
+                                .setElementType(
+                                        PythonTypeUtils.toProtoType(
+                                                arrayDataType
+                                                        .getElementDataType()
+                                                        .getLogicalType())));
+            } else if (DataViewUtils.isDataView(logicalType, MapView.class)) {
+                final KeyValueDataType mapDataType =
+                        (KeyValueDataType) dataType.getChildren().get(0);
+                stateBuilder.setMapView(
+                        FlinkFnApi.UserDefinedProcessTableFunction.State.MapView.newBuilder()
+                                .setKeyType(
+                                        PythonTypeUtils.toProtoType(
+                                                mapDataType.getKeyDataType().getLogicalType()))
+                                .setValueType(
+                                        PythonTypeUtils.toProtoType(
+                                                mapDataType.getValueDataType().getLogicalType())));
+            } else {
+                stateBuilder.setValue(PythonTypeUtils.toProtoType(logicalType));
+            }
+            builder.addStates(stateBuilder);
         }
         builder.addAllJobParameters(
                 getRuntimeContext().getGlobalJobParameters().entrySet().stream()

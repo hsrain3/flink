@@ -152,14 +152,30 @@ class UserDefinedProcessTableFunction(_message.Message):
         traits: _containers.RepeatedScalarFieldContainer[str]
         def __init__(self, name: _Optional[str] = ..., type: _Optional[_Union[Schema.FieldType, _Mapping]] = ..., is_table: bool = ..., traits: _Optional[_Iterable[str]] = ...) -> None: ...
     class State(_message.Message):
-        __slots__ = ("name", "type", "ttl_millis")
+        __slots__ = ("name", "value", "list_view", "map_view", "ttl_millis")
+        class ListView(_message.Message):
+            __slots__ = ("element_type",)
+            ELEMENT_TYPE_FIELD_NUMBER: _ClassVar[int]
+            element_type: Schema.FieldType
+            def __init__(self, element_type: _Optional[_Union[Schema.FieldType, _Mapping]] = ...) -> None: ...
+        class MapView(_message.Message):
+            __slots__ = ("key_type", "value_type")
+            KEY_TYPE_FIELD_NUMBER: _ClassVar[int]
+            VALUE_TYPE_FIELD_NUMBER: _ClassVar[int]
+            key_type: Schema.FieldType
+            value_type: Schema.FieldType
+            def __init__(self, key_type: _Optional[_Union[Schema.FieldType, _Mapping]] = ..., value_type: _Optional[_Union[Schema.FieldType, _Mapping]] = ...) -> None: ...
         NAME_FIELD_NUMBER: _ClassVar[int]
-        TYPE_FIELD_NUMBER: _ClassVar[int]
+        VALUE_FIELD_NUMBER: _ClassVar[int]
+        LIST_VIEW_FIELD_NUMBER: _ClassVar[int]
+        MAP_VIEW_FIELD_NUMBER: _ClassVar[int]
         TTL_MILLIS_FIELD_NUMBER: _ClassVar[int]
         name: str
-        type: Schema.FieldType
+        value: Schema.FieldType
+        list_view: UserDefinedProcessTableFunction.State.ListView
+        map_view: UserDefinedProcessTableFunction.State.MapView
         ttl_millis: int
-        def __init__(self, name: _Optional[str] = ..., type: _Optional[_Union[Schema.FieldType, _Mapping]] = ..., ttl_millis: _Optional[int] = ...) -> None: ...
+        def __init__(self, name: _Optional[str] = ..., value: _Optional[_Union[Schema.FieldType, _Mapping]] = ..., list_view: _Optional[_Union[UserDefinedProcessTableFunction.State.ListView, _Mapping]] = ..., map_view: _Optional[_Union[UserDefinedProcessTableFunction.State.MapView, _Mapping]] = ..., ttl_millis: _Optional[int] = ...) -> None: ...
     PAYLOAD_FIELD_NUMBER: _ClassVar[int]
     ARGUMENTS_FIELD_NUMBER: _ClassVar[int]
     STATES_FIELD_NUMBER: _ClassVar[int]

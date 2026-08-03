@@ -104,6 +104,15 @@ class StateListView(ListView, StateDataView[N], ABC):
     def add_all(self, values):
         self._list_state.add_all(values)
 
+    def remove(self, value):
+        values = list(self._list_state.get())
+        try:
+            values.remove(value)
+        except ValueError:
+            return False
+        self._list_state.update(values)
+        return True
+
     def clear(self):
         self._list_state.clear()
 

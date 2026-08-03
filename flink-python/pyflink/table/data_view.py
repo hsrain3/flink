@@ -47,7 +47,8 @@ class DataView(ABC):
 class ListView(DataView, Generic[T]):
     """
     A :class:`DataView` that provides list-like functionality in the accumulator of an
-    AggregateFunction when large amounts of data are expected.
+    AggregateFunction or as a top-level state entry of a ProcessTableFunction when large amounts
+    of data are expected.
     """
 
     def __init__(self):
@@ -70,6 +71,14 @@ class ListView(DataView, Generic[T]):
         Adds all of the elements of the specified list to this list view.
         """
         self._list.extend(values)
+
+    def remove(self, value: T) -> bool:
+        """Removes the first occurrence of the given value if present."""
+        try:
+            self._list.remove(value)
+            return True
+        except ValueError:
+            return False
 
     def clear(self) -> None:
         self._list = []
@@ -110,7 +119,8 @@ class ListView(DataView, Generic[T]):
 class MapView(Generic[K, V]):
     """
     A :class:`DataView` that provides dict-like functionality in the accumulator of an
-    AggregateFunction when large amounts of data are expected.
+    AggregateFunction or as a top-level state entry of a ProcessTableFunction when large amounts
+    of data are expected.
     """
 
     def __init__(self):

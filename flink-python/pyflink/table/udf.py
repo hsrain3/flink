@@ -386,7 +386,7 @@ class ProcessTableFunctionArgument(object):
 
 @PublicEvolving()
 class ProcessTableFunctionState(object):
-    """Declaration of a keyed value state entry of a process table function.
+    """Declaration of a keyed state entry of a process table function.
 
     .. versionadded:: 2.4.0
     """
@@ -394,9 +394,10 @@ class ProcessTableFunctionState(object):
     def __init__(self, name: str, data_type: DataType, ttl=None):
         if not isinstance(name, str) or not name:
             raise ValueError("The state name must be a non-empty string.")
-        from pyflink.table.types import RowType
-        if not isinstance(data_type, RowType):
-            raise TypeError("Process table function state must use a ROW data type.")
+        from pyflink.table.types import ListViewType, MapViewType, RowType
+        if not isinstance(data_type, (RowType, ListViewType, MapViewType)):
+            raise TypeError(
+                "Process table function state must use a ROW, LIST_VIEW, or MAP_VIEW data type.")
         if ttl is not None:
             from pyflink.common import Duration
             if not isinstance(ttl, Duration):
@@ -409,6 +410,25 @@ class ProcessTableFunctionState(object):
     def value(name: str, data_type: DataType, ttl=None) -> 'ProcessTableFunctionState':
         """Declares a ROW value state entry."""
         return ProcessTableFunctionState(name, data_type, ttl)
+
+    @staticmethod
+    def list_view(name: str, element_type: DataType,
+                  ttl=None) -> 'ProcessTableFunctionState':
+        """Declares a state-backed :class:`~pyflink.table.data_view.ListView`."""
+        if not isinstance(element_type, DataType):
+            raise TypeError("A ListView element type must be a DataType.")
+        from pyflink.table import DataTypes
+        return ProcessTableFunctionState(name, DataTypes.LIST_VIEW(element_type), ttl)
+
+    @staticmethod
+    def map_view(name: str, key_type: DataType, value_type: DataType,
+                 ttl=None) -> 'ProcessTableFunctionState':
+        """Declares a state-backed :class:`~pyflink.table.data_view.MapView`."""
+        if not isinstance(key_type, DataType) or not isinstance(value_type, DataType):
+            raise TypeError("MapView key and value types must be DataType values.")
+        from pyflink.table import DataTypes
+        return ProcessTableFunctionState(
+            name, DataTypes.MAP_VIEW(key_type, value_type), ttl)
 
 
 T = TypeVar('T')

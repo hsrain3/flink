@@ -99,6 +99,21 @@ class EmitUnexpectedDelete(ProcessTableFunction):
         yield Row.of_kind(RowKind.DELETE, event.value)
 
 
+class TrackStateViews(ProcessTableFunction):
+    def eval(self, ctx, memory, history, counts, event):
+        memory["count"] = (memory.count or 0) + 1
+        if event.action == "clear":
+            ctx.clear_all_state()
+        elif event.action == "remove":
+            history.remove(event.value)
+            counts.remove(event.value)
+        else:
+            history.add(event.value)
+            counts.put(event.value, (counts.get(event.value) or 0) + 1)
+        yield Row(event.sequence, memory.count, len(list(history.get())),
+                  counts.get(event.value) or 0)
+
+
 class ProcessTableFunctionTests(PyFlinkTestCase):
 
     @staticmethod
@@ -182,6 +197,83 @@ class ProcessTableFunctionTests(PyFlinkTestCase):
         self.assertTrue(java_mode.contains(RowKind.UPDATE_AFTER.to_j_row_kind()))
         self.assertTrue(java_mode.contains(RowKind.DELETE.to_j_row_kind()))
         self.assertFalse(java_mode.keyOnlyDeletes())
+
+    def test_declares_state_views(self):
+        states = [
+            ProcessTableFunctionState.list_view(
+                "history", DataTypes.STRING(), Duration.of_hours(1)),
+            ProcessTableFunctionState.map_view(
+                "counts", DataTypes.STRING(), DataTypes.BIGINT(), Duration.of_hours(2)),
+        ]
+        function = udptf(
+            TrackStateViews(),
+            arguments=[ProcessTableFunctionArgument.table(
+                "event", traits={Trait.SET_SEMANTIC_TABLE})],
+            states=[ProcessTableFunctionState.value(
+                "memory", DataTypes.ROW([DataTypes.FIELD("count", DataTypes.BIGINT())]))] + states,
+            result_type=DataTypes.ROW([
+                DataTypes.FIELD("sequence", DataTypes.INT()),
+                DataTypes.FIELD("invocations", DataTypes.BIGINT()),
+                DataTypes.FIELD("history_size", DataTypes.INT()),
+                DataTypes.FIELD("value_count", DataTypes.BIGINT()),
+            ]),
+        )
+
+        state_strategies = function._java_user_defined_function() \
+            .getTypeInference(None).getStateTypeStrategies()
+        self.assertEqual(["memory", "history", "counts"], list(state_strategies.keySet()))
+
+    def test_state_views_execution_and_key_isolation(self):
+        table_env = TableEnvironment.create(EnvironmentSettings.in_streaming_mode())
+        table_env.get_config().set("python.fn-execution.bundle.size", "1")
+        function = udptf(
+            TrackStateViews(),
+            arguments=[ProcessTableFunctionArgument.table(
+                "event", traits={Trait.SET_SEMANTIC_TABLE})],
+            states=[
+                ProcessTableFunctionState.value(
+                    "memory",
+                    DataTypes.ROW([DataTypes.FIELD("count", DataTypes.BIGINT())])),
+                ProcessTableFunctionState.list_view("history", DataTypes.STRING()),
+                ProcessTableFunctionState.map_view(
+                    "counts", DataTypes.STRING(), DataTypes.BIGINT()),
+            ],
+            result_type=DataTypes.ROW([
+                DataTypes.FIELD("sequence", DataTypes.INT()),
+                DataTypes.FIELD("invocations", DataTypes.BIGINT()),
+                DataTypes.FIELD("history_size", DataTypes.INT()),
+                DataTypes.FIELD("value_count", DataTypes.BIGINT()),
+            ]),
+        )
+        table_env.create_temporary_system_function("track_views", function)
+        events = table_env.from_elements(
+            [
+                (1, 1, "add", "a"),
+                (1, 2, "add", "a"),
+                (2, 3, "add", "a"),
+                (1, 4, "clear", "a"),
+                (1, 5, "add", "b"),
+                (1, 6, "remove", "b"),
+            ],
+            DataTypes.ROW([
+                DataTypes.FIELD("id", DataTypes.INT()),
+                DataTypes.FIELD("sequence", DataTypes.INT()),
+                DataTypes.FIELD("action", DataTypes.STRING()),
+                DataTypes.FIELD("value", DataTypes.STRING()),
+            ]))
+
+        result = events.partition_by(col("id")).process("track_views")
+        with result.execute().collect() as rows:
+            actual = sorted((row[1], row[2], row[3], row[4]) for row in rows)
+
+        self.assertEqual([
+            (1, 1, 1, 1),
+            (2, 2, 2, 2),
+            (3, 1, 1, 1),
+            (4, 3, 2, 2),
+            (5, 1, 1, 1),
+            (6, 2, 0, 0),
+        ], actual)
 
     def test_table_process_and_from_call_plan(self):
         table_env = TableEnvironment.create(EnvironmentSettings.in_streaming_mode())

@@ -23,6 +23,7 @@ from pyflink.datastream.state import StateTtlConfig
 from pyflink.fn_execution import pickle
 from pyflink.fn_execution.coders import LengthPrefixBaseCoder, from_proto
 from pyflink.fn_execution.table.operations import BaseOperation
+from pyflink.fn_execution.table.state_data_view import KeyedStateListView, KeyedStateMapView
 from pyflink.table.changelog_mode import ChangelogMode
 from pyflink.table.udf import (
     ProcessTableFunctionSortDirection,
@@ -236,6 +237,7 @@ class ProcessTableFunctionOperation(BaseOperation):
         self._function = pickle.loads(serialized_fn.payload)
         self._state_specs = list(serialized_fn.states)
         self._state_handles = []
+        self._state_kinds = []
         self._timer_emitter = _TimerCommandEmitter(keyed_state_backend)
         table_semantics = {
             semantics.argument_name: _to_table_semantics(semantics)
@@ -263,8 +265,23 @@ class ProcessTableFunctionOperation(BaseOperation):
             if state.ttl_millis > 0:
                 ttl_config = StateTtlConfig.new_builder(
                     Time.milliseconds(state.ttl_millis)).build()
-            self._state_handles.append(self.keyed_state_backend.get_value_state(
-                state.name, from_proto(state.type), ttl_config))
+            state_kind = state.WhichOneof("state_type")
+            if state_kind == "value":
+                handle = self.keyed_state_backend.get_value_state(
+                    state.name, from_proto(state.value), ttl_config)
+            elif state_kind == "list_view":
+                handle = KeyedStateListView(self.keyed_state_backend.get_list_state(
+                    state.name, from_proto(state.list_view.element_type), ttl_config))
+            elif state_kind == "map_view":
+                handle = KeyedStateMapView(self.keyed_state_backend.get_map_state(
+                    state.name,
+                    from_proto(state.map_view.key_type),
+                    from_proto(state.map_view.value_type),
+                    ttl_config))
+            else:
+                raise ValueError("Unknown PTF state type for state: %s" % state.name)
+            self._state_kinds.append(state_kind)
+            self._state_handles.append(handle)
 
     def finish(self):
         super(ProcessTableFunctionOperation, self).finish()
@@ -307,18 +324,24 @@ class ProcessTableFunctionOperation(BaseOperation):
 
     def _read_states(self):
         states = []
-        for spec, handle in zip(self._state_specs, self._state_handles):
-            value = handle.value()
-            if value is None:
-                value = Row(**{field.name: None for field in spec.type.row_schema.fields})
-            states.append(value)
+        for spec, kind, handle in zip(
+                self._state_specs, self._state_kinds, self._state_handles):
+            if kind == "value":
+                value = handle.value()
+                if value is None:
+                    value = Row(**{field.name: None for field in spec.value.row_schema.fields})
+                states.append(value)
+            else:
+                states.append(handle)
         return states
 
     def _write_states(self, states):
         clear_all = None in self._context._cleared_states
-        for spec, handle, value in zip(self._state_specs, self._state_handles, states):
-            if clear_all or spec.name in self._context._cleared_states or all(
-                    field is None for field in value._values):
+        for spec, kind, handle, value in zip(
+                self._state_specs, self._state_kinds, self._state_handles, states):
+            if clear_all or spec.name in self._context._cleared_states:
                 handle.clear()
-            else:
+            elif kind == "value" and all(field is None for field in value._values):
+                handle.clear()
+            elif kind == "value":
                 handle.update(value)

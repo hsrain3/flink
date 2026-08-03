@@ -56,6 +56,67 @@ class _StateHandle(object):
         self._value = None
 
 
+class _ListStateHandle(object):
+
+    def __init__(self):
+        self.values = []
+        self.clear_count = 0
+
+    def get(self):
+        return iter(self.values)
+
+    def add(self, value):
+        self.values.append(value)
+
+    def add_all(self, values):
+        self.values.extend(values)
+
+    def update(self, values):
+        self.values = list(values)
+
+    def clear(self):
+        self.clear_count += 1
+        self.values = []
+
+
+class _MapStateHandle(object):
+
+    def __init__(self):
+        self.data = {}
+        self.clear_count = 0
+
+    def get(self, key):
+        return self.data.get(key)
+
+    def put(self, key, value):
+        self.data[key] = value
+
+    def put_all(self, values):
+        self.data.update(values)
+
+    def remove(self, key):
+        self.data.pop(key, None)
+
+    def contains(self, key):
+        return key in self.data
+
+    def items(self):
+        return self.data.items()
+
+    def keys(self):
+        return self.data.keys()
+
+    def values(self):
+        return self.data.values()
+
+    def is_empty(self):
+        return not self.data
+
+    def clear(self):
+        self.clear_count += 1
+        self.data = {}
+
+
 class _TimerEmitter(object):
 
     def __init__(self):
@@ -82,7 +143,18 @@ class _StateBackend(_KeyedBackend):
 
     def get_value_state(self, name, coder, ttl_config):
         handle = _StateHandle()
-        self.requests.append((name, coder, ttl_config, handle))
+        self.requests.append(("value", name, coder, ttl_config, handle))
+        return handle
+
+    def get_list_state(self, name, coder, ttl_config):
+        handle = _ListStateHandle()
+        self.requests.append(("list_view", name, coder, ttl_config, handle))
+        return handle
+
+    def get_map_state(self, name, key_coder, value_coder, ttl_config):
+        handle = _MapStateHandle()
+        self.requests.append(
+            ("map_view", name, key_coder, value_coder, ttl_config, handle))
         return handle
 
 
@@ -90,7 +162,9 @@ def _state_spec(name, *field_names):
     fields = [SimpleNamespace(name=field_name) for field_name in field_names]
     return SimpleNamespace(
         name=name,
-        type=SimpleNamespace(row_schema=SimpleNamespace(fields=fields)))
+        value=SimpleNamespace(row_schema=SimpleNamespace(fields=fields)),
+        ttl_millis=0,
+        WhichOneof=lambda _: "value")
 
 
 def _state_spec_with_ttl(name, ttl_millis, *field_names):
@@ -103,6 +177,7 @@ def _operation(handle):
     operation = object.__new__(ProcessTableFunctionOperation)
     operation._state_specs = [_state_spec("memory", "count")]
     operation._state_handles = [handle]
+    operation._state_kinds = ["value"]
     operation._context = _ProcessTableFunctionContext(_TimerEmitter())
     operation._context.set_event(1000, 900, 800)
     return operation
@@ -176,6 +251,7 @@ class ProcessTableFunctionOperationTests(unittest.TestCase):
             _state_spec("second", "count"),
         ]
         operation._state_handles = [first, second]
+        operation._state_kinds = ["value", "value"]
 
         def callback(ctx, first_state, second_state):
             first_state["count"] += 1
@@ -195,6 +271,7 @@ class ProcessTableFunctionOperationTests(unittest.TestCase):
             _state_spec_with_ttl("persistent", 0, "count"),
         ]
         operation._state_handles = []
+        operation._state_kinds = []
 
         with mock.patch(
                 'pyflink.fn_execution.table.process_table_function.from_proto',
@@ -202,12 +279,81 @@ class ProcessTableFunctionOperationTests(unittest.TestCase):
             operation._open_state_handles()
 
         self.assertEqual(["expiring", "persistent"],
-                         [request[0] for request in backend.requests])
-        self.assertEqual(["state-coder", "state-coder"],
                          [request[1] for request in backend.requests])
-        self.assertEqual(1234, backend.requests[0][2].get_ttl().to_milliseconds())
-        self.assertIsNone(backend.requests[1][2])
+        self.assertEqual(["state-coder", "state-coder"],
+                         [request[2] for request in backend.requests])
+        self.assertEqual(1234, backend.requests[0][3].get_ttl().to_milliseconds())
+        self.assertIsNone(backend.requests[1][3])
         self.assertEqual(2, len(operation._state_handles))
+
+    def test_state_views_use_incremental_remote_state_and_independent_ttl(self):
+        backend = _StateBackend()
+        operation = object.__new__(ProcessTableFunctionOperation)
+        operation.keyed_state_backend = backend
+        operation._state_specs = []
+        operation._state_handles = []
+        operation._state_kinds = []
+
+        list_spec = flink_fn_execution_pb2.UserDefinedProcessTableFunction.State(
+            name="history", ttl_millis=1000)
+        list_spec.list_view.element_type.type_name = flink_fn_execution_pb2.Schema.VARCHAR
+        map_spec = flink_fn_execution_pb2.UserDefinedProcessTableFunction.State(
+            name="counts", ttl_millis=2000)
+        map_spec.map_view.key_type.type_name = flink_fn_execution_pb2.Schema.VARCHAR
+        map_spec.map_view.value_type.type_name = flink_fn_execution_pb2.Schema.BIGINT
+        operation._state_specs.extend([list_spec, map_spec])
+
+        with mock.patch(
+                'pyflink.fn_execution.table.process_table_function.from_proto',
+                side_effect=["element-coder", "key-coder", "value-coder"]):
+            operation._open_state_handles()
+
+        history, counts = operation._read_states()
+        history.add_all(["a", "b", "a"])
+        self.assertTrue(history.remove("a"))
+        self.assertFalse(history.remove("missing"))
+        counts.put("a", 2)
+        counts.put("b", 1)
+        counts.remove("b")
+
+        self.assertEqual(["b", "a"], list(history.get()))
+        self.assertEqual([("a", 2)], list(counts.items()))
+        self.assertEqual(["list_view", "map_view"],
+                         [request[0] for request in backend.requests])
+        self.assertEqual(1000, backend.requests[0][3].get_ttl().to_milliseconds())
+        self.assertEqual(2000, backend.requests[1][4].get_ttl().to_milliseconds())
+
+    def test_clear_all_state_covers_value_and_state_views(self):
+        value = _StateHandle(Row(count=1))
+        list_state = _ListStateHandle()
+        map_state = _MapStateHandle()
+        operation = _operation(value)
+        operation._state_specs = [
+            _state_spec("memory", "count"),
+            SimpleNamespace(name="history"),
+            SimpleNamespace(name="counts"),
+        ]
+        from pyflink.fn_execution.table.state_data_view import (
+            KeyedStateListView,
+            KeyedStateMapView,
+        )
+        operation._state_handles = [
+            value,
+            KeyedStateListView(list_state),
+            KeyedStateMapView(map_state),
+        ]
+        operation._state_kinds = ["value", "list_view", "map_view"]
+
+        def callback(ctx, memory, history, counts):
+            memory["count"] = 2
+            history.add("event")
+            counts.put("event", 1)
+            ctx.clear_all_state()
+
+        self.assertEqual([], list(operation._invoke(callback, [])))
+        self.assertEqual(1, value.clear_count)
+        self.assertEqual(1, list_state.clear_count)
+        self.assertEqual(1, map_state.clear_count)
 
     def test_zero_to_many_results(self):
         handle = _StateHandle(Row(count=1))

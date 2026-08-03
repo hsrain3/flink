@@ -131,8 +131,21 @@ message UserDefinedProcessTableFunction {
   }
 
   message State {
+    message ListView {
+      Schema.FieldType element_type = 1;
+    }
+
+    message MapView {
+      Schema.FieldType key_type = 1;
+      Schema.FieldType value_type = 2;
+    }
+
     string name = 1;
-    Schema.FieldType type = 2;
+    oneof state_type {
+      Schema.FieldType value = 2;
+      ListView list_view = 4;
+      MapView map_view = 5;
+    }
     int64 ttl_millis = 3;
   }
 

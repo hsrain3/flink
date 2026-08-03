@@ -938,12 +938,12 @@ class ListViewType(DataType):
         return "ListViewType(%s)" % repr(self._element_type)
 
     def to_sql_type(self, obj):
-        raise Exception("ListViewType can only be used in accumulator type declaration of "
-                        "AggregateFunction.")
+        raise Exception("ListViewType can only be used in AggregateFunction accumulator or "
+                        "ProcessTableFunction state declarations.")
 
     def from_sql_type(self, obj):
-        raise Exception("ListViewType can only be used in accumulator type declaration of "
-                        "AggregateFunction.")
+        raise Exception("ListViewType can only be used in AggregateFunction accumulator or "
+                        "ProcessTableFunction state declarations.")
 
 
 class MapType(DataType):
@@ -1009,12 +1009,12 @@ class MapViewType(DataType):
         return "MapViewType(%s, %s)" % (repr(self._key_type), repr(self._value_type))
 
     def to_sql_type(self, obj):
-        raise Exception("MapViewType can only be used in accumulator type declaration of "
-                        "AggregateFunction.")
+        raise Exception("MapViewType can only be used in AggregateFunction accumulator or "
+                        "ProcessTableFunction state declarations.")
 
     def from_sql_type(self, obj):
-        raise Exception("MapViewType can only be used in accumulator type declaration of "
-                        "AggregateFunction.")
+        raise Exception("MapViewType can only be used in AggregateFunction accumulator or "
+                        "ProcessTableFunction state declarations.")
 
 
 class MultisetType(DataType):
@@ -2630,7 +2630,8 @@ class DataTypes(object):
         """
         Data type of a :class:`pyflink.table.data_view.ListView`.
 
-        It can only be used in accumulator type declaration of an Aggregate Function.
+        It can be used in an accumulator type declaration of an AggregateFunction or as a
+        top-level state entry of a ProcessTableFunction.
 
         :param element_type: :class:`DataType` of each element in the list view.
         """
@@ -2654,9 +2655,10 @@ class DataTypes(object):
     @staticmethod
     def MAP_VIEW(key_type: DataType, value_type: DataType) -> MapViewType:
         """
-        Data type of a :class:`pyflink.table.data_view.ListView`.
+        Data type of a :class:`pyflink.table.data_view.MapView`.
 
-        It can only be used in accumulator type declaration of an Aggregate Function.
+        It can be used in an accumulator type declaration of an AggregateFunction or as a
+        top-level state entry of a ProcessTableFunction.
 
         :param key_type: :class:`DataType` of the keys in the map view.
         :param value_type: :class:`DataType` of the values in the map view.
