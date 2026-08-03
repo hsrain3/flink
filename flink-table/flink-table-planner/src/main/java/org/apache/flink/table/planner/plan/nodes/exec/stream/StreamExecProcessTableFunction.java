@@ -223,6 +223,20 @@ public class StreamExecProcessTableFunction extends ExecNodeBase<RowData>
         final CodeGeneratorContext ctx =
                 new CodeGeneratorContext(config, planner.getFlinkContext().getClassLoader());
 
+        final GeneratedRecordComparator[] orderByComparators =
+                generateOrderByComparators(
+                        planner.getFlinkContext().getClassLoader(),
+                        ctx,
+                        config,
+                        providedInputArgs,
+                        operands);
+        final List<StateTtlConfig> inputBufferTtlConfigs =
+                StateMetadata.getStateTtlForMultiInputOperator(
+                                config, runtimeTableSemantics.size(), List.of())
+                        .stream()
+                        .map(StateConfigUtil::createTtlConfig)
+                        .collect(Collectors.toList());
+
         final RexCall udfCall = StreamPhysicalProcessTableFunction.toUdfCall(invocation);
         if (((BridgingSqlFunction) udfCall.getOperator()).getDefinition()
                 instanceof PythonProcessTableFunction) {
@@ -233,6 +247,8 @@ public class StreamExecProcessTableFunction extends ExecNodeBase<RowData>
                     runtimeTableSemantics,
                     ctx,
                     udfCall,
+                    orderByComparators[0],
+                    inputBufferTtlConfigs.get(0),
                     (PythonProcessTableFunction)
                             ((BridgingSqlFunction) udfCall.getOperator()).getDefinition());
         }
@@ -275,26 +291,6 @@ public class StreamExecProcessTableFunction extends ExecNodeBase<RowData>
 
         final RuntimeChangelogMode producedChangelogMode =
                 RuntimeChangelogMode.serialize(outputChangelogMode);
-
-        // Generate comparators for ORDER BY columns
-        final GeneratedRecordComparator[] orderByComparators =
-                generateOrderByComparators(
-                        planner.getFlinkContext().getClassLoader(),
-                        ctx,
-                        config,
-                        providedInputArgs,
-                        operands);
-
-        // Create TTL config for input sort buffers (one per input)
-        // Use empty state metadata list as input sort buffers don't have user-defined state
-        final List<Long> inputBufferTtlMillis =
-                StateMetadata.getStateTtlForMultiInputOperator(
-                        config, runtimeTableSemantics.size(), List.of());
-        // Convert to StateTtlConfig list (one per input)
-        final List<StateTtlConfig> inputBufferTtlConfigs =
-                inputBufferTtlMillis.stream()
-                        .map(StateConfigUtil::createTtlConfig)
-                        .collect(Collectors.toList());
 
         final ProcessTableOperatorFactory operatorFactory =
                 new ProcessTableOperatorFactory(
@@ -344,15 +340,14 @@ public class StreamExecProcessTableFunction extends ExecNodeBase<RowData>
             List<RuntimeTableSemantics> runtimeTableSemantics,
             CodeGeneratorContext codeGeneratorContext,
             RexCall udfCall,
+            @Nullable GeneratedRecordComparator orderByComparator,
+            StateTtlConfig inputBufferTtlConfig,
             PythonProcessTableFunction function) {
         if (inputTransforms.size() != 1 || runtimeTableSemantics.size() != 1) {
             throw new TableException(
                     "Python process table functions support exactly one table input.");
         }
         final RuntimeTableSemantics semantics = runtimeTableSemantics.get(0);
-        if (semantics.orderByColumns().length > 0) {
-            throw new TableException("Python process table functions do not support ORDER BY.");
-        }
         if (function.hasOnTimer() && semantics.passColumnsThrough()) {
             throw new TableException(
                     "Python process table function timers do not support pass-through columns.");
@@ -408,6 +403,8 @@ public class StreamExecProcessTableFunction extends ExecNodeBase<RowData>
                         projectionResult.getArgumentType(),
                         resultType,
                         keyType,
+                        orderByComparator,
+                        inputBufferTtlConfig,
                         projectionResult.getProjection());
 
         final String effectiveUid =
@@ -454,6 +451,8 @@ public class StreamExecProcessTableFunction extends ExecNodeBase<RowData>
             RowType argumentType,
             RowType resultType,
             RowType keyType,
+            @Nullable GeneratedRecordComparator orderByComparator,
+            StateTtlConfig inputBufferTtlConfig,
             GeneratedProjection projection) {
         final String className =
                 "org.apache.flink.table.runtime.operators.python.process."
@@ -470,6 +469,8 @@ public class StreamExecProcessTableFunction extends ExecNodeBase<RowData>
                             RowType.class,
                             RowType.class,
                             RowType.class,
+                            GeneratedRecordComparator.class,
+                            StateTtlConfig.class,
                             GeneratedProjection.class);
             return (OneInputStreamOperator<RowData, RowData>)
                     constructor.newInstance(
@@ -481,6 +482,8 @@ public class StreamExecProcessTableFunction extends ExecNodeBase<RowData>
                             argumentType,
                             resultType,
                             keyType,
+                            orderByComparator,
+                            inputBufferTtlConfig,
                             projection);
         } catch (NoSuchMethodException
                 | InstantiationException

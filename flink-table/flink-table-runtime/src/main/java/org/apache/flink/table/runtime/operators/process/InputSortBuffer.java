@@ -55,12 +55,12 @@ import java.util.Set;
  * sorted order according to the ORDER BY specification.
  */
 @Internal
-class InputSortBuffer implements Triggerable<RowData, VoidNamespace> {
+public class InputSortBuffer implements Triggerable<RowData, VoidNamespace> {
 
     private static final Set<String> ORDERED_STATE_BACKENDS = Set.of("rocksdb", "forst");
 
     /** Functional interface for consuming sorted rows. */
-    interface SortedRowConsumer {
+    public interface SortedRowConsumer {
         void accept(RowData row) throws Exception;
     }
 
@@ -74,7 +74,7 @@ class InputSortBuffer implements Triggerable<RowData, VoidNamespace> {
 
     private long triggeringWatermark = Long.MIN_VALUE;
 
-    InputSortBuffer(
+    public InputSortBuffer(
             int inputIdx,
             LogicalType inputRowType,
             int timeColumn,
@@ -102,17 +102,17 @@ class InputSortBuffer implements Triggerable<RowData, VoidNamespace> {
     }
 
     /** Sets the timer service after construction. Must be called before processing any elements. */
-    void setTimerService(InternalTimerService<VoidNamespace> timerService) {
+    public void setTimerService(InternalTimerService<VoidNamespace> timerService) {
         this.timerService = timerService;
     }
 
     /** Returns the timer service for this sorting service. */
-    InternalTimerService<VoidNamespace> getTimerService() {
+    public InternalTimerService<VoidNamespace> getTimerService() {
         return timerService;
     }
 
     /** Processes an input element, buffering it for later sorted emission. */
-    void processElement(RowData input) throws Exception {
+    public void processElement(RowData input) throws Exception {
         final long rowTime = input.getLong(timeColumn);
 
         // Drop late events

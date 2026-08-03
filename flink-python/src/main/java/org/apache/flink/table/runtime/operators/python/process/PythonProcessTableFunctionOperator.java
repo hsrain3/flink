@@ -21,6 +21,7 @@ package org.apache.flink.table.runtime.operators.python.process;
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.api.common.state.MapState;
 import org.apache.flink.api.common.state.MapStateDescriptor;
+import org.apache.flink.api.common.state.StateTtlConfig;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.api.common.typeutils.base.LongSerializer;
 import org.apache.flink.api.java.tuple.Tuple3;
@@ -51,7 +52,10 @@ import org.apache.flink.table.functions.ProcessTableFunction;
 import org.apache.flink.table.functions.python.PythonEnv;
 import org.apache.flink.table.functions.python.PythonProcessTableFunction;
 import org.apache.flink.table.runtime.generated.GeneratedProjection;
+import org.apache.flink.table.runtime.generated.GeneratedRecordComparator;
 import org.apache.flink.table.runtime.generated.Projection;
+import org.apache.flink.table.runtime.generated.RecordComparator;
+import org.apache.flink.table.runtime.operators.process.InputSortBuffer;
 import org.apache.flink.table.runtime.operators.process.RuntimeStateInfo;
 import org.apache.flink.table.runtime.operators.process.RuntimeTableSemantics;
 import org.apache.flink.table.runtime.operators.process.WritableInternalTimeContext;
@@ -107,6 +111,8 @@ public final class PythonProcessTableFunctionOperator
     private final RowType argumentType;
     private final RowType resultType;
     private final RowType keyType;
+    private final @Nullable GeneratedRecordComparator orderByGeneratedComparator;
+    private final StateTtlConfig inputBufferTtlConfig;
     private final GeneratedProjection argumentGeneratedProjection;
 
     private transient Projection<RowData, BinaryRowData> argumentProjection;
@@ -135,6 +141,7 @@ public final class PythonProcessTableFunctionOperator
     private transient @Nullable ProcessTableTimerRegistration timerRegistration;
     private transient RowType runnerInputType;
     private transient RowType timerDataType;
+    private transient @Nullable InputSortBuffer inputSortBuffer;
 
     public PythonProcessTableFunctionOperator(
             Configuration config,
@@ -145,6 +152,8 @@ public final class PythonProcessTableFunctionOperator
             RowType argumentType,
             RowType resultType,
             RowType keyType,
+            @Nullable GeneratedRecordComparator orderByGeneratedComparator,
+            StateTtlConfig inputBufferTtlConfig,
             GeneratedProjection argumentGeneratedProjection) {
         super(config);
         this.function = function;
@@ -154,6 +163,8 @@ public final class PythonProcessTableFunctionOperator
         this.argumentType = argumentType;
         this.resultType = resultType;
         this.keyType = keyType;
+        this.orderByGeneratedComparator = orderByGeneratedComparator;
+        this.inputBufferTtlConfig = inputBufferTtlConfig;
         this.argumentGeneratedProjection = argumentGeneratedProjection;
     }
 
@@ -185,11 +196,19 @@ public final class PythonProcessTableFunctionOperator
         inputWatermark = Long.MIN_VALUE;
         setTimerServices();
         super.open();
+        setInputSortBuffer();
     }
 
     @Override
     public void processElement(StreamRecord<RowData> element) throws Exception {
-        final RowData input = element.getValue();
+        if (inputSortBuffer != null) {
+            inputSortBuffer.processElement(element.getValue());
+        } else {
+            processInput(element.getValue());
+        }
+    }
+
+    private void processInput(RowData input) throws Exception {
         final RowData key =
                 tableSemantics.hasSetSemantics() ? (RowData) getCurrentKey() : GenericRowData.of();
         final RowData prefix = createPrefix(input, key);
@@ -212,8 +231,11 @@ public final class PythonProcessTableFunctionOperator
 
     @Override
     public void processWatermark(Watermark mark) throws Exception {
-        inputWatermark = mark.getTimestamp();
+        if (inputSortBuffer != null) {
+            inputSortBuffer.updateWatermark(mark.getTimestamp());
+        }
         super.processWatermark(mark);
+        inputWatermark = mark.getTimestamp();
     }
 
     @Override
@@ -422,6 +444,29 @@ public final class PythonProcessTableFunctionOperator
                         timeContext,
                         timerDataSerializer,
                         keyType.getFieldCount());
+    }
+
+    private void setInputSortBuffer() {
+        if (orderByGeneratedComparator == null) {
+            inputSortBuffer = null;
+            return;
+        }
+        final RecordComparator comparator =
+                orderByGeneratedComparator.newInstance(
+                        Thread.currentThread().getContextClassLoader());
+        inputSortBuffer =
+                new InputSortBuffer(
+                        0,
+                        inputType,
+                        tableSemantics.orderByColumns()[0],
+                        comparator,
+                        getKeyedStateStore(),
+                        this::processInput,
+                        inputBufferTtlConfig,
+                        getKeyedStateBackend());
+        inputSortBuffer.setTimerService(
+                getInternalTimerService(
+                        "input-sort-buffer-0", VoidNamespaceSerializer.INSTANCE, inputSortBuffer));
     }
 
     private RowType createRunnerInputType() {

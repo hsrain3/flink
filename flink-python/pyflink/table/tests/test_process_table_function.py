@@ -69,6 +69,11 @@ class PassThroughLength(ProcessTableFunction):
         yield Row(len(event.text))
 
 
+class OrderedScores(ProcessTableFunction):
+    def eval(self, ctx, event):
+        yield Row(event.score)
+
+
 class ProcessTableFunctionTests(PyFlinkTestCase):
 
     @staticmethod
@@ -245,6 +250,36 @@ class ProcessTableFunctionTests(PyFlinkTestCase):
         plan = result.explain()
         self.assertIn("ProcessTableFunction", plan)
         self.assertIn("Exchange", plan)
+
+    def test_order_by_plan(self):
+        table_env = TableEnvironment.create(EnvironmentSettings.in_streaming_mode())
+        function = udptf(
+            OrderedScores(),
+            arguments=[ProcessTableFunctionArgument.table(
+                "event", traits={Trait.SET_SEMANTIC_TABLE})],
+            result_type=DataTypes.ROW([DataTypes.FIELD("score", DataTypes.INT())]),
+        )
+        table_env.create_temporary_system_function("ordered_scores", function)
+        table_env.execute_sql("""
+            CREATE TEMPORARY TABLE ordered_events (
+                user_id STRING,
+                score INT,
+                ts TIMESTAMP_LTZ(3),
+                WATERMARK FOR ts AS ts - INTERVAL '1' SECOND
+            ) WITH (
+                'connector' = 'datagen',
+                'number-of-rows' = '1'
+            )
+        """)
+
+        result = table_env.from_path("ordered_events").partition_by(
+            col("user_id")).order_by(col("ts").asc, col("score").desc).process(
+                "ordered_scores")
+
+        plan = result.explain()
+        self.assertIn("ProcessTableFunction", plan)
+        self.assertIn("ORDER BY", plan)
+        self.assertIn("DESC", plan)
 
     def test_stateful_named_timer_execution(self):
         table_env = TableEnvironment.create(EnvironmentSettings.in_streaming_mode())
