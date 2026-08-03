@@ -109,6 +109,7 @@ public final class PythonProcessTableFunctionOperator
     private final PythonProcessTableFunction function;
     private final RuntimeTableSemantics tableSemantics;
     private final RuntimeChangelogMode producedChangelogMode;
+    private transient ChangelogMode changelogMode;
     private final List<RuntimeStateInfo> stateInfos;
     private final RowType inputType;
     private final RowType argumentType;
@@ -163,6 +164,7 @@ public final class PythonProcessTableFunctionOperator
         this.function = function;
         this.tableSemantics = tableSemantics;
         this.producedChangelogMode = producedChangelogMode;
+        this.changelogMode = producedChangelogMode.deserialize();
         this.stateInfos = stateInfos;
         this.inputType = inputType;
         this.argumentType = argumentType;
@@ -175,6 +177,7 @@ public final class PythonProcessTableFunctionOperator
 
     @Override
     public void open() throws Exception {
+        changelogMode = producedChangelogMode.deserialize();
         bais = new ByteArrayInputStreamWithPos();
         baisWrapper = new DataInputViewStreamWrapper(bais);
         baos = new ByteArrayOutputStreamWithPos();
@@ -310,7 +313,7 @@ public final class PythonProcessTableFunctionOperator
                                         .asClassLoader()),
                 createFlattenRowTypeCoderInfoDescriptorProto(
                         runnerInputType, FlinkFnApi.CoderInfoDescriptor.Mode.MULTIPLE, true),
-                createFlattenRowTypeCoderInfoDescriptorProto(
+                createRowTypeCoderInfoDescriptorProto(
                         resultType, FlinkFnApi.CoderInfoDescriptor.Mode.MULTIPLE, true),
                 timerRegistration == null
                         ? null
@@ -335,9 +338,12 @@ public final class PythonProcessTableFunctionOperator
             }
             bais.setBuffer(resultTuple.f1, 0, resultTuple.f2);
             final RowData result = resultSerializer.deserialize(baisWrapper);
-            if (result.getRowKind() != RowKind.INSERT) {
+            if (!changelogMode.contains(result.getRowKind())) {
                 throw new TableRuntimeException(
-                        "Python process table functions support append-only output.");
+                        String.format(
+                                "Invalid row kind received: %s. "
+                                        + "Expected produced changelog mode: %s",
+                                result.getRowKind(), changelogMode));
             }
             emitResultRow(currentInvocation, result);
             resultTuple = pythonFunctionRunner.pollResult();
@@ -355,14 +361,15 @@ public final class PythonProcessTableFunctionOperator
     }
 
     private void emitResultRow(Invocation invocation, RowData result) {
-        withResult.replace(invocation.prefix, result).setRowKind(RowKind.INSERT);
+        final RowKind kind = result.getRowKind();
+        withResult.replace(invocation.prefix, result).setRowKind(kind);
         if (shouldEmitRowtime()) {
             final GenericRowData rowtime =
                     GenericRowData.of(
                             invocation.time == null
                                     ? null
                                     : TimestampData.fromEpochMillis(invocation.time));
-            withRowtime.replace(withResult, rowtime).setRowKind(RowKind.INSERT);
+            withRowtime.replace(withResult, rowtime).setRowKind(kind);
             outputCollector.collect(withRowtime);
         } else {
             outputCollector.collect(withResult);

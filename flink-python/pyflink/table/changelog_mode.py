@@ -50,14 +50,16 @@ class ChangelogMode(object):
             gateway.jvm.org.apache.flink.table.connector.ChangelogMode.insertOnly())
 
     @staticmethod
-    def upsert():
+    def upsert(key_only_deletes: bool = True):
         """
         Shortcut for an upsert changelog that describes idempotent updates on a key and thus does
-        does not contain :attr:`~pyflink.common.RowKind.UPDATE_BEFORE` rows.
+        not contain :attr:`~pyflink.common.RowKind.UPDATE_BEFORE` rows.
+
+        :param key_only_deletes: Whether delete rows contain only key columns.
         """
         gateway = get_gateway()
         return ChangelogMode(
-            gateway.jvm.org.apache.flink.table.connector.ChangelogMode.upsert())
+            gateway.jvm.org.apache.flink.table.connector.ChangelogMode.upsert(key_only_deletes))
 
     @staticmethod
     def all():

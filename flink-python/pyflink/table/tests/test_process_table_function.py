@@ -18,6 +18,7 @@
 
 from pyflink.common import Duration, Row, RowKind
 from pyflink.table import DataTypes, EnvironmentSettings, TableEnvironment
+from pyflink.table.changelog_mode import ChangelogMode
 from pyflink.table.expressions import col, descriptor, lit
 from pyflink.table.udf import (
     ProcessTableFunction,
@@ -81,6 +82,21 @@ class InspectTableSemantics(ProcessTableFunction):
             len(semantics.data_type().field_names()),
             semantics.partition_by_columns()[0],
             ctx.get_changelog_mode().contains_only(RowKind.INSERT))
+
+
+class EmitDeclaredKind(ProcessTableFunction):
+    def eval(self, ctx, event):
+        yield Row.of_kind(RowKind(event.kind), event.value)
+
+
+class ForwardInputKind(ProcessTableFunction):
+    def eval(self, ctx, event):
+        yield Row.of_kind(event.get_row_kind(), str(event.get_row_kind()))
+
+
+class EmitUnexpectedDelete(ProcessTableFunction):
+    def eval(self, ctx, event):
+        yield Row.of_kind(RowKind.DELETE, event.value)
 
 
 class ProcessTableFunctionTests(PyFlinkTestCase):
@@ -151,6 +167,21 @@ class ProcessTableFunctionTests(PyFlinkTestCase):
         self.assertEqual("PythonProcessTableFunction", java_function.getClass().getSimpleName())
         static_arguments = java_function.getTypeInference(None).getStaticArguments().get()
         self.assertEqual(["event", "separator"], [a.getName() for a in static_arguments])
+
+    def test_declares_fixed_changelog_mode(self):
+        function = udptf(
+            EmitDeclaredKind(),
+            arguments=[ProcessTableFunctionArgument.table(
+                "event", traits={Trait.SET_SEMANTIC_TABLE})],
+            result_type=DataTypes.ROW([DataTypes.FIELD("value", DataTypes.STRING())]),
+            changelog_mode=ChangelogMode.upsert(False),
+        )
+
+        java_mode = function._java_user_defined_function().getChangelogMode(None)
+        self.assertTrue(java_mode.contains(RowKind.INSERT.to_j_row_kind()))
+        self.assertTrue(java_mode.contains(RowKind.UPDATE_AFTER.to_j_row_kind()))
+        self.assertTrue(java_mode.contains(RowKind.DELETE.to_j_row_kind()))
+        self.assertFalse(java_mode.keyOnlyDeletes())
 
     def test_table_process_and_from_call_plan(self):
         table_env = TableEnvironment.create(EnvironmentSettings.in_streaming_mode())
@@ -315,6 +346,158 @@ class ProcessTableFunctionTests(PyFlinkTestCase):
 
         with result.execute().collect() as rows:
             self.assertEqual([Row(7, 2, 0, True)], list(rows))
+
+    def test_upsert_output_execution(self):
+        table_env = TableEnvironment.create(EnvironmentSettings.in_streaming_mode())
+        table_env.get_config().set("python.fn-execution.bundle.size", "1")
+        function = udptf(
+            EmitDeclaredKind(),
+            arguments=[ProcessTableFunctionArgument.table(
+                "event", traits={Trait.SET_SEMANTIC_TABLE})],
+            result_type=DataTypes.ROW([DataTypes.FIELD("value", DataTypes.STRING())]),
+            changelog_mode=ChangelogMode.upsert(False),
+        )
+        table_env.create_temporary_system_function("emit_upsert", function)
+        events = table_env.from_elements(
+            [(1, RowKind.INSERT.value, "first"),
+             (1, RowKind.UPDATE_AFTER.value, "second"),
+             (1, RowKind.DELETE.value, "second")],
+            DataTypes.ROW([
+                DataTypes.FIELD("id", DataTypes.INT()),
+                DataTypes.FIELD("kind", DataTypes.INT()),
+                DataTypes.FIELD("value", DataTypes.STRING()),
+            ]))
+
+        result = events.partition_by(col("id")).process("emit_upsert")
+
+        table_env.execute_sql("""
+            CREATE TEMPORARY TABLE upsert_sink (
+                id INT,
+                payload STRING,
+                PRIMARY KEY (id) NOT ENFORCED
+            ) WITH (
+                'connector' = 'blackhole'
+            )
+        """)
+        result.execute_insert("upsert_sink").wait()
+
+    def test_retract_output_supports_row_semantics(self):
+        table_env = TableEnvironment.create(EnvironmentSettings.in_streaming_mode())
+        table_env.get_config().set("python.fn-execution.bundle.size", "1")
+        function = udptf(
+            EmitDeclaredKind(),
+            arguments=[ProcessTableFunctionArgument.table(
+                "event", traits={Trait.ROW_SEMANTIC_TABLE})],
+            result_type=DataTypes.ROW([DataTypes.FIELD("value", DataTypes.STRING())]),
+            changelog_mode=ChangelogMode.all(),
+        )
+        table_env.create_temporary_system_function("emit_retract", function)
+        events = table_env.from_elements(
+            [(RowKind.UPDATE_BEFORE.value, "old"),
+             (RowKind.UPDATE_AFTER.value, "new")],
+            DataTypes.ROW([
+                DataTypes.FIELD("kind", DataTypes.INT()),
+                DataTypes.FIELD("value", DataTypes.STRING()),
+            ]))
+
+        with events.process("emit_retract").execute().collect() as rows:
+            actual = [(row.get_row_kind(), row[0]) for row in rows]
+        self.assertEqual([
+            (RowKind.UPDATE_BEFORE, "old"),
+            (RowKind.UPDATE_AFTER, "new"),
+        ], actual)
+
+    def test_updating_input_preserves_row_kinds(self):
+        table_env = TableEnvironment.create(EnvironmentSettings.in_streaming_mode())
+        table_env.get_config().set("python.fn-execution.bundle.size", "1")
+        function = udptf(
+            ForwardInputKind(),
+            arguments=[ProcessTableFunctionArgument.table(
+                "event",
+                traits={
+                    Trait.SET_SEMANTIC_TABLE,
+                    Trait.SUPPORT_UPDATES,
+                    Trait.REQUIRE_UPDATE_BEFORE,
+                })],
+            result_type=DataTypes.ROW([DataTypes.FIELD("kind", DataTypes.STRING())]),
+            changelog_mode=ChangelogMode.all(),
+        )
+        table_env.create_temporary_system_function("forward_changes", function)
+        events = table_env.from_elements(
+            [("A", 1), ("A", 2)],
+            DataTypes.ROW([
+                DataTypes.FIELD("name", DataTypes.STRING()),
+                DataTypes.FIELD("score", DataTypes.INT()),
+            ]))
+        updates = events.group_by(col("name")).select(
+            col("name"), col("score").sum.alias("score"))
+
+        result = updates.partition_by(col("name")).process("forward_changes")
+
+        with result.execute().collect() as rows:
+            actual_kinds = [row.get_row_kind() for row in rows]
+        self.assertEqual(
+            [RowKind.INSERT, RowKind.UPDATE_BEFORE, RowKind.UPDATE_AFTER], actual_kinds)
+
+    def test_rejects_output_kind_outside_declared_mode(self):
+        table_env = TableEnvironment.create(EnvironmentSettings.in_streaming_mode())
+        table_env.get_config().set("python.fn-execution.bundle.size", "1")
+        function = udptf(
+            EmitUnexpectedDelete(),
+            arguments=[ProcessTableFunctionArgument.table(
+                "event", traits={Trait.ROW_SEMANTIC_TABLE})],
+            result_type=DataTypes.ROW([DataTypes.FIELD("value", DataTypes.STRING())]),
+        )
+        table_env.create_temporary_system_function("invalid_change", function)
+        events = table_env.from_elements(
+            [("value",)],
+            DataTypes.ROW([DataTypes.FIELD("value", DataTypes.STRING())]))
+
+        with self.assertRaisesRegex(Exception, "Invalid row kind received: DELETE"):
+            with events.process("invalid_change").execute().collect() as rows:
+                list(rows)
+
+    def test_upsert_output_requires_set_semantics(self):
+        table_env = TableEnvironment.create(EnvironmentSettings.in_streaming_mode())
+        function = udptf(
+            EmitDeclaredKind(),
+            arguments=[ProcessTableFunctionArgument.table(
+                "event", traits={Trait.ROW_SEMANTIC_TABLE})],
+            result_type=DataTypes.ROW([DataTypes.FIELD("value", DataTypes.STRING())]),
+            changelog_mode=ChangelogMode.upsert(),
+        )
+        table_env.create_temporary_system_function("invalid_upsert", function)
+        events = table_env.from_elements(
+            [(RowKind.INSERT.value, "value")],
+            DataTypes.ROW([
+                DataTypes.FIELD("kind", DataTypes.INT()),
+                DataTypes.FIELD("value", DataTypes.STRING()),
+            ]))
+
+        with self.assertRaisesRegex(Exception, "row semantics.*upsert output"):
+            events.process("invalid_upsert").explain()
+
+    def test_updating_input_rejects_pass_through_columns(self):
+        table_env = TableEnvironment.create(EnvironmentSettings.in_streaming_mode())
+        function = udptf(
+            ForwardInputKind(),
+            arguments=[ProcessTableFunctionArgument.table(
+                "event",
+                traits={
+                    Trait.ROW_SEMANTIC_TABLE,
+                    Trait.PASS_COLUMNS_THROUGH,
+                    Trait.SUPPORT_UPDATES,
+                })],
+            result_type=DataTypes.ROW([DataTypes.FIELD("kind", DataTypes.STRING())]),
+            changelog_mode=ChangelogMode.all(),
+        )
+        table_env.create_temporary_system_function("invalid_updates", function)
+        events = table_env.from_elements(
+            [("value",)],
+            DataTypes.ROW([DataTypes.FIELD("value", DataTypes.STRING())]))
+
+        with self.assertRaisesRegex(Exception, "updating inputs must not pass columns through"):
+            events.process("invalid_updates").explain()
 
     def test_stateful_named_timer_execution(self):
         table_env = TableEnvironment.create(EnvironmentSettings.in_streaming_mode())

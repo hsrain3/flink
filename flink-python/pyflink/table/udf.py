@@ -24,6 +24,7 @@ from typing import Union, List, Type, Callable, TypeVar, Generic, Iterable, Opti
 from pyflink.java_gateway import get_gateway
 from pyflink.metrics import MetricGroup
 from pyflink.table import Expression
+from pyflink.table.changelog_mode import ChangelogMode
 from pyflink.table.types import DataType, _to_java_data_type
 from pyflink.util import java_utils
 from pyflink.util.api_stability_decorators import PublicEvolving, Internal
@@ -860,12 +861,13 @@ class UserDefinedProcessTableFunctionWrapper(UserDefinedFunctionWrapper):
     def __init__(self, func: ProcessTableFunction,
                  arguments: Sequence[ProcessTableFunctionArgument],
                  states: Sequence[ProcessTableFunctionState], result_type: DataType,
-                 deterministic=None, name=None):
+                 changelog_mode: ChangelogMode, deterministic=None, name=None):
         super(UserDefinedProcessTableFunctionWrapper, self).__init__(
             func, None, "general", deterministic, name)
         self._arguments = tuple(arguments)
         self._states = tuple(states)
         self._result_type = result_type
+        self._changelog_mode = changelog_mode
         self._has_on_timer = func.__class__.on_timer is not ProcessTableFunction.on_timer
 
     def _create_judf(self, serialized_func, j_input_types, j_function_kind):
@@ -889,6 +891,9 @@ class UserDefinedProcessTableFunctionWrapper(UserDefinedFunctionWrapper):
         state_ttls = java_utils.to_jarray(
             gateway.jvm.java.time.Duration,
             [state.ttl._j_duration if state.ttl is not None else None for state in self._states])
+        changelog_kinds = bytearray(
+            kind.value for kind in sorted(
+                self._changelog_mode.get_contained_kinds(), key=lambda kind: kind.value))
 
         PythonProcessTableFunction = gateway.jvm \
             .org.apache.flink.table.functions.python.PythonProcessTableFunction
@@ -903,6 +908,8 @@ class UserDefinedProcessTableFunctionWrapper(UserDefinedFunctionWrapper):
             state_types,
             state_ttls,
             _to_java_data_type(self._result_type),
+            changelog_kinds,
+            self._changelog_mode.key_only_deletes(),
             self._deterministic,
             self._has_on_timer,
             _get_python_env())
@@ -1011,9 +1018,9 @@ def _create_udtf(f, input_types, result_types, deterministic, name):
     return UserDefinedTableFunctionWrapper(f, input_types, result_types, deterministic, name)
 
 
-def _create_udptf(f, arguments, states, result_type, deterministic, name):
+def _create_udptf(f, arguments, states, result_type, changelog_mode, deterministic, name):
     return UserDefinedProcessTableFunctionWrapper(
-        f, arguments, states, result_type, deterministic, name)
+        f, arguments, states, result_type, changelog_mode, deterministic, name)
 
 
 def _create_udaf(f, input_types, result_type, accumulator_type, func_type, deterministic, name):
@@ -1168,6 +1175,7 @@ def udptf(f: Union[ProcessTableFunction, Type] = None,
           arguments: Sequence[ProcessTableFunctionArgument] = None,
           result_type: DataType = None,
           states: Sequence[ProcessTableFunctionState] = None,
+          changelog_mode: ChangelogMode = None,
           deterministic: bool = None,
           name: str = None):
     """
@@ -1175,6 +1183,8 @@ def udptf(f: Union[ProcessTableFunction, Type] = None,
 
     The ``eval`` callback receives ``ctx``, all declared states, and all declared arguments in
     exactly that order. An optional ``on_timer`` callback receives ``ctx`` and all states.
+    ``changelog_mode`` declares the row kinds that the function can produce and defaults to
+    :func:`~pyflink.table.ChangelogMode.insert_only`.
 
     .. versionadded:: 2.4.0
     """
@@ -1184,6 +1194,7 @@ def udptf(f: Union[ProcessTableFunction, Type] = None,
             arguments=arguments,
             result_type=result_type,
             states=states,
+            changelog_mode=changelog_mode,
             deterministic=deterministic,
             name=name)
 
@@ -1204,6 +1215,10 @@ def udptf(f: Union[ProcessTableFunction, Type] = None,
     from pyflink.table.types import RowType
     if not isinstance(result_type, RowType):
         raise TypeError("result_type must be a ROW DataType.")
+    if changelog_mode is None:
+        changelog_mode = ChangelogMode.insert_only()
+    if not isinstance(changelog_mode, ChangelogMode):
+        raise TypeError("changelog_mode must be a ChangelogMode.")
 
     table_arguments = [argument for argument in arguments if argument.is_table]
     if len(table_arguments) != 1:
@@ -1212,13 +1227,6 @@ def udptf(f: Union[ProcessTableFunction, Type] = None,
     if len(names) != len(set(names)):
         raise ValueError("Process table function state and argument names must be unique.")
 
-    unsupported_update_traits = {
-        ProcessTableFunctionArgumentTrait.SUPPORT_UPDATES,
-        ProcessTableFunctionArgumentTrait.REQUIRE_UPDATE_BEFORE,
-        ProcessTableFunctionArgumentTrait.REQUIRE_FULL_DELETE,
-    }
-    if table_arguments[0].traits.intersection(unsupported_update_traits):
-        raise ValueError("Python process table functions do not support updating inputs.")
     if states and ProcessTableFunctionArgumentTrait.SET_SEMANTIC_TABLE \
             not in table_arguments[0].traits:
         raise ValueError("State requires a table argument with set semantics.")
@@ -1234,7 +1242,8 @@ def udptf(f: Union[ProcessTableFunction, Type] = None,
             raise ValueError("Timers do not support pass-through columns.")
         _validate_process_table_function_signature(f, 'on_timer', ['ctx'] + state_names)
 
-    return _create_udptf(f, arguments, states, result_type, deterministic, name)
+    return _create_udptf(
+        f, arguments, states, result_type, changelog_mode, deterministic, name)
 
 
 def udaf(f: Union[Callable, AggregateFunction, Type] = None,

@@ -16,13 +16,13 @@
 # limitations under the License.
 ################################################################################
 import datetime
+from collections.abc import Generator
 
 from pyflink.common import Instant, Row, RowKind, Time
 from pyflink.datastream.state import StateTtlConfig
 from pyflink.fn_execution import pickle
 from pyflink.fn_execution.coders import LengthPrefixBaseCoder, from_proto
 from pyflink.fn_execution.table.operations import BaseOperation
-from pyflink.fn_execution.utils.operation_utils import normalize_table_function_result
 from pyflink.table.changelog_mode import ChangelogMode
 from pyflink.table.udf import (
     ProcessTableFunctionSortDirection,
@@ -62,6 +62,23 @@ def _to_table_semantics(table_semantics_proto):
 
 def _state_key(key):
     return list(key) if isinstance(key, Row) else key
+
+
+def _normalize_process_table_function_result(results):
+    if results is None:
+        return iter(())
+    values = results if isinstance(results, (list, range, Generator)) else (results,)
+
+    def normalize():
+        for value in values:
+            if isinstance(value, Row):
+                yield value
+            elif isinstance(value, tuple):
+                yield Row(*value)
+            else:
+                yield Row(value)
+
+    return normalize()
 
 
 def _to_millis(value):
@@ -279,7 +296,7 @@ class ProcessTableFunctionOperation(BaseOperation):
             completed = False
             try:
                 results = callback(self._context, *states, *arguments)
-                for result in normalize_table_function_result(results):
+                for result in _normalize_process_table_function_result(results):
                     yield result
                 completed = True
             finally:

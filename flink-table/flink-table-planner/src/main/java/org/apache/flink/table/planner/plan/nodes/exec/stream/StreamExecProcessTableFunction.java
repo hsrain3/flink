@@ -354,12 +354,6 @@ public class StreamExecProcessTableFunction extends ExecNodeBase<RowData>
             throw new TableException(
                     "Python process table function timers do not support pass-through columns.");
         }
-        if (!inputChangelogModes.get(0).equals(ChangelogMode.insertOnly())
-                || !outputChangelogMode.equals(ChangelogMode.insertOnly())) {
-            throw new TableException(
-                    "Python process table functions support append-only input and output.");
-        }
-
         final ClassLoader classLoader = planner.getFlinkContext().getClassLoader();
         final Configuration pythonConfig =
                 CommonPythonUtil.extractPythonConfiguration(planner.getTableConfig(), classLoader);

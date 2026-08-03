@@ -19,10 +19,12 @@
 package org.apache.flink.table.functions.python;
 
 import org.apache.flink.table.api.DataTypes;
+import org.apache.flink.table.connector.ChangelogMode;
 import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.inference.StaticArgument;
 import org.apache.flink.table.types.inference.StaticArgumentTrait;
 import org.apache.flink.table.types.inference.TypeInference;
+import org.apache.flink.types.RowKind;
 
 import org.junit.jupiter.api.Test;
 
@@ -57,6 +59,7 @@ class PythonProcessTableFunctionTest {
         assertThat(typeInference.getStateTypeStrategies()).containsOnlyKeys("memory");
         assertThat(function.getStateTimeToLive()).containsExactly(Duration.ofDays(1));
         assertThat(function.hasOnTimer()).isTrue();
+        assertThat(function.getChangelogMode(null)).isEqualTo(ChangelogMode.upsert(false));
         assertThat(function.getPythonEnv().getExecType()).isEqualTo(PythonEnv.ExecType.PROCESS);
     }
 
@@ -75,6 +78,8 @@ class PythonProcessTableFunctionTest {
                                         new DataType[0],
                                         new Duration[0],
                                         RESULT_TYPE,
+                                        new byte[] {RowKind.INSERT.toByteValue()},
+                                        false,
                                         true,
                                         false,
                                         new PythonEnv(PythonEnv.ExecType.PROCESS)))
@@ -94,6 +99,12 @@ class PythonProcessTableFunctionTest {
                 new DataType[] {STATE_TYPE},
                 new Duration[] {Duration.ofDays(1)},
                 RESULT_TYPE,
+                new byte[] {
+                    RowKind.INSERT.toByteValue(),
+                    RowKind.UPDATE_AFTER.toByteValue(),
+                    RowKind.DELETE.toByteValue()
+                },
+                false,
                 true,
                 true,
                 new PythonEnv(PythonEnv.ExecType.PROCESS));

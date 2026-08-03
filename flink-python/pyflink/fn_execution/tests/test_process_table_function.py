@@ -119,7 +119,7 @@ class ProcessTableFunctionOperationTests(unittest.TestCase):
             memory["count"] = 1
             yield Row(1)
 
-        self.assertEqual([[1]], list(operation._invoke(callback, [])))
+        self.assertEqual([Row(1)], list(operation._invoke(callback, [])))
         self.assertEqual(1, handle.updated[0].count)
         self.assertEqual(0, handle.clear_count)
 
@@ -221,7 +221,17 @@ class ProcessTableFunctionOperationTests(unittest.TestCase):
             yield Row(2)
 
         self.assertEqual([], list(operation._invoke(no_results, [])))
-        self.assertEqual([[1], [2]], list(operation._invoke(many_results, [])))
+        self.assertEqual([Row(1), Row(2)], list(operation._invoke(many_results, [])))
+
+    def test_result_row_kind_is_preserved(self):
+        operation = _operation(_StateHandle(Row(count=1)))
+
+        def emit_delete(ctx, memory):
+            yield Row.of_kind(RowKind.DELETE, memory.count)
+
+        result = list(operation._invoke(emit_delete, []))[0]
+
+        self.assertEqual(RowKind.DELETE, result.get_row_kind())
 
     def test_process_timer_sets_key_and_current_timer(self):
         handle = _StateHandle(Row(count=3))
@@ -239,7 +249,7 @@ class ProcessTableFunctionOperationTests(unittest.TestCase):
             (TRIGGER, 1200, "timeout", key, 1100, 1150)))
 
         self.assertEqual(["user-1"], backend.current_key)
-        self.assertEqual([[3, "timeout"]], results)
+        self.assertEqual([Row(3, "timeout")], results)
         self.assertEqual(1200, operation._context.time_context(int).time())
 
 

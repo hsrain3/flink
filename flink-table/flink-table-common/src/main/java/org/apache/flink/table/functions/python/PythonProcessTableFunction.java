@@ -20,6 +20,8 @@ package org.apache.flink.table.functions.python;
 
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.table.catalog.DataTypeFactory;
+import org.apache.flink.table.connector.ChangelogMode;
+import org.apache.flink.table.functions.ChangelogFunction;
 import org.apache.flink.table.functions.ProcessTableFunction;
 import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.inference.StateTypeStrategy;
@@ -28,6 +30,7 @@ import org.apache.flink.table.types.inference.StaticArgumentTrait;
 import org.apache.flink.table.types.inference.TypeInference;
 import org.apache.flink.table.types.inference.TypeStrategies;
 import org.apache.flink.types.Row;
+import org.apache.flink.types.RowKind;
 import org.apache.flink.util.Preconditions;
 
 import javax.annotation.Nullable;
@@ -41,7 +44,7 @@ import java.util.List;
 /** Planner placeholder for a Python user-defined process table function. */
 @Internal
 public class PythonProcessTableFunction extends ProcessTableFunction<Row>
-        implements PythonFunction {
+        implements PythonFunction, ChangelogFunction {
 
     private static final long serialVersionUID = 1L;
 
@@ -55,6 +58,8 @@ public class PythonProcessTableFunction extends ProcessTableFunction<Row>
     private final DataType[] stateDataTypes;
     private final Duration[] stateTimeToLive;
     private final DataType resultType;
+    private final byte[] changelogKinds;
+    private final boolean keyOnlyDeletes;
     private final boolean deterministic;
     private final boolean hasOnTimer;
     private final PythonEnv pythonEnv;
@@ -70,6 +75,8 @@ public class PythonProcessTableFunction extends ProcessTableFunction<Row>
             DataType[] stateDataTypes,
             Duration[] stateTimeToLive,
             DataType resultType,
+            byte[] changelogKinds,
+            boolean keyOnlyDeletes,
             boolean deterministic,
             boolean hasOnTimer,
             PythonEnv pythonEnv) {
@@ -84,6 +91,8 @@ public class PythonProcessTableFunction extends ProcessTableFunction<Row>
         this.stateDataTypes = Preconditions.checkNotNull(stateDataTypes);
         this.stateTimeToLive = Preconditions.checkNotNull(stateTimeToLive);
         this.resultType = Preconditions.checkNotNull(resultType);
+        this.changelogKinds = Preconditions.checkNotNull(changelogKinds).clone();
+        this.keyOnlyDeletes = keyOnlyDeletes;
         this.deterministic = deterministic;
         this.hasOnTimer = hasOnTimer;
         this.pythonEnv = Preconditions.checkNotNull(pythonEnv);
@@ -152,6 +161,15 @@ public class PythonProcessTableFunction extends ProcessTableFunction<Row>
     }
 
     @Override
+    public ChangelogMode getChangelogMode(ChangelogContext changelogContext) {
+        final ChangelogMode.Builder builder = ChangelogMode.newBuilder();
+        for (byte kind : changelogKinds) {
+            builder.addContainedKind(RowKind.fromByteValue(kind));
+        }
+        return builder.keyOnlyDeletes(keyOnlyDeletes).build();
+    }
+
+    @Override
     public TypeInference getTypeInference(DataTypeFactory typeFactory) {
         final List<StaticArgument> staticArguments = new ArrayList<>();
         for (int i = 0; i < argumentNames.length; i++) {
@@ -201,6 +219,8 @@ public class PythonProcessTableFunction extends ProcessTableFunction<Row>
                 stateNames.length == stateDataTypes.length
                         && stateNames.length == stateTimeToLive.length,
                 "State metadata must have equal lengths.");
+        Preconditions.checkArgument(
+                changelogKinds.length > 0, "At least one changelog kind must be declared.");
     }
 
     private static EnumSet<StaticArgumentTrait> parseTraits(String serializedTraits) {
