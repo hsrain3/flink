@@ -23,8 +23,9 @@ limitations under the License.
 PyFlink PTF Phase 1 以补齐单表输入的 Streaming PTF 完整链路为目标，而不是一次性实现与
 Java PTF 的全部功能对齐。
 
-用户可以继承 `ProcessTableFunction`，通过 `udptf()` 声明有序参数、状态和结果类型，
-注册函数名称后使用 `Table.process()` 或 `TableEnvironment.from_call()` 调用。
+用户可以使用 `@udptf` 装饰普通 Python 函数，通过有序 mapping 声明参数、状态和结果类型，
+注册函数名称后使用 `Table.process()` 或 `TableEnvironment.from_call()` 调用。复杂函数仍可使用
+`ProcessTableFunction` 类风格，但本文的用户示例统一采用推荐的 Pythonic decorator 风格。
 
 ## 社区实现现状
 
@@ -91,6 +92,10 @@ worker、Value State、State Views、事件时间 Timer bridge、`ORDER BY`、Ta
 changelog 和最小恢复验证。该实现复用社区 Java PTF 语义以及现有 Flink/Python state、
 checkpoint、watermark 和 Beam 基础设施。
 
+本文示例采用目标 Pythonic public API。普通函数 decorator、mapping shorthand 和无名称
+state/argument descriptor 仍需要在 Python API PR 中落地；它们只负责将声明归一化为现有
+有序参数和状态模型，不改变已经实现的 planner、proto 或 runtime 语义。
+
 这些改动尚未通过 Apache Flink 社区的 FLIP、代码审查和发布流程。因此本文中的
 “已实现”仅表示当前功能分支状态，不表示 Apache Flink 稳定版或社区 `master` 已支持
 Python-defined PTF。新增 PyFlink 公共 API 在合入前仍需要获得 FLIP 批准，并补充 JIRA、
@@ -100,7 +105,7 @@ release note、兼容性说明和社区级 CI 验证。
 
 | 领域 | Phase 1 支持范围 | 对应 Case |
 |------|--------------|-----------|
-| 定义方式 | 继承 `ProcessTableFunction` 并通过 `udptf()` 创建 Python PTF | Case 1 |
+| 定义方式 | 使用 `@udptf` 装饰普通 Python 函数，通过 mapping 声明参数和状态 | Case 1 |
 | 调用方式 | 注册名称后使用 `Table.process()`、`TableEnvironment.from_call()` 或 SQL | Case 2、17 |
 | 参数 | 恰好一个表参数，以及零个或多个按声明顺序注入的标量参数 | Case 3 |
 | 表语义 | 支持 Row/Set semantics、分区以及单表核心 `TableSemantics` metadata | Case 4、14 |
@@ -126,36 +131,29 @@ release note、兼容性说明和社区级 CI 验证。
 from pyflink.common import Row
 from pyflink.table import DataTypes
 from pyflink.table.udf import (
-    ProcessTableFunction,
-    ProcessTableFunctionArgument,
     ProcessTableFunctionArgumentTrait as Trait,
+    table_arg,
     udptf,
 )
 
 
-class Tokenize(ProcessTableFunction):
-    def eval(self, ctx, event, separator):
-        for token in event.text.split(separator):
-            if token:
-                yield Row(token=token)
-
-
-tokenize = udptf(
-    Tokenize(),
-    arguments=[
-        ProcessTableFunctionArgument.table(
-            "event", traits={Trait.ROW_SEMANTIC_TABLE}
-        ),
-        ProcessTableFunctionArgument.scalar("separator", DataTypes.STRING()),
-    ],
-    result_type=DataTypes.ROW([
-        DataTypes.FIELD("token", DataTypes.STRING()),
-    ]),
+@udptf(
+    arguments={
+        "event": table_arg(traits={Trait.ROW_SEMANTIC_TABLE}),
+        "separator": DataTypes.STRING(),
+    },
+    result_type="ROW<token STRING>",
 )
+def tokenize(ctx, event, separator):
+    for token in event.text.split(separator):
+        if token:
+            yield Row(token=token)
+
+
 t_env.create_temporary_system_function("tokenize", tokenize)
 ```
 
-**预期：** `udptf()` 保留参数的声明顺序，并校验 `eval()` 必须是
+**预期：** `udptf()` 保留 `arguments` mapping 的插入顺序，并校验回调必须是
 `(ctx, event, separator)`。名称、数量或顺序不匹配时在定义阶段报错。
 
 ### Case 2：隐式和显式调用
@@ -182,22 +180,16 @@ explicit_result = t_env.from_call(
 ### Case 3：单表参数和有序标量参数
 
 ```python
-class Wrap(ProcessTableFunction):
-    def eval(self, ctx, event, prefix, suffix):
-        yield Row(value=prefix + event.text + suffix)
-
-
-wrap = udptf(
-    Wrap(),
-    arguments=[
-        ProcessTableFunctionArgument.table("event"),
-        ProcessTableFunctionArgument.scalar("prefix", DataTypes.STRING()),
-        ProcessTableFunctionArgument.scalar("suffix", DataTypes.STRING()),
-    ],
-    result_type=DataTypes.ROW([
-        DataTypes.FIELD("value", DataTypes.STRING()),
-    ]),
+@udptf(
+    arguments={
+        "event": table_arg(),
+        "prefix": DataTypes.STRING(),
+        "suffix": DataTypes.STRING(),
+    },
+    result_type="ROW<value STRING>",
 )
+def wrap(ctx, event, prefix, suffix):
+    yield Row(value=prefix + event.text + suffix)
 ```
 
 **预期：** 每次回调按 `event`、`prefix`、`suffix` 的声明顺序注入参数。首版
@@ -207,14 +199,10 @@ wrap = udptf(
 
 ```python
 # 无状态：每行独立调用。
-row_argument = ProcessTableFunctionArgument.table(
-    "event", traits={Trait.ROW_SEMANTIC_TABLE}
-)
+row_argument = table_arg(traits={Trait.ROW_SEMANTIC_TABLE})
 
 # 有状态：相同 user_id 共享一份 keyed state。
-set_argument = ProcessTableFunctionArgument.table(
-    "event", traits={Trait.SET_SEMANTIC_TABLE}
-)
+set_argument = table_arg(traits={Trait.SET_SEMANTIC_TABLE})
 result = events.partition_by(col("user_id")).process("count_by_key")
 ```
 
@@ -225,13 +213,11 @@ result = events.partition_by(col("user_id")).process("count_by_key")
 ### Case 5：表参数 Trait
 
 ```python
-pass_through = ProcessTableFunctionArgument.table(
-    "event",
+pass_through = table_arg(
     traits={Trait.ROW_SEMANTIC_TABLE, Trait.PASS_COLUMNS_THROUGH},
 )
 
-required_time = ProcessTableFunctionArgument.table(
-    "event",
+required_time = table_arg(
     traits={Trait.SET_SEMANTIC_TABLE, Trait.REQUIRE_ON_TIME},
 )
 result = events.partition_by(col("user_id")).process(
@@ -248,45 +234,29 @@ result = events.partition_by(col("user_id")).process(
 
 ```python
 from pyflink.common import Duration
-from pyflink.table.udf import ProcessTableFunctionState
+from pyflink.table.udf import value_state
 
 
-class CountAndRemember(ProcessTableFunction):
-    def eval(self, ctx, count_state, last_state, event):
-        previous = last_state.text
-        count_state["value"] = (count_state.value or 0) + 1
-        last_state["text"] = event.text
-        yield Row(count=count_state.value, previous=previous)
-
-        if event.text == "reset":
-            ctx.clear_state("count_state")
-
-
-states = [
-    ProcessTableFunctionState.value(
-        "count_state",
-        DataTypes.ROW([DataTypes.FIELD("value", DataTypes.BIGINT())]),
-        ttl=Duration.of_days(1),
-    ),
-    ProcessTableFunctionState.value(
-        "last_state",
-        DataTypes.ROW([DataTypes.FIELD("text", DataTypes.STRING())]),
-    ),
-]
-
-count_and_remember = udptf(
-    CountAndRemember(),
-    arguments=[
-        ProcessTableFunctionArgument.table(
-            "event", traits={Trait.SET_SEMANTIC_TABLE}
+@udptf(
+    arguments={
+        "event": table_arg(traits={Trait.SET_SEMANTIC_TABLE}),
+    },
+    states={
+        "count_state": value_state(
+            "ROW<value BIGINT>", ttl=Duration.of_days(1)
         ),
-    ],
-    states=states,
-    result_type=DataTypes.ROW([
-        DataTypes.FIELD("count", DataTypes.BIGINT()),
-        DataTypes.FIELD("previous", DataTypes.STRING()),
-    ]),
+        "last_state": value_state("ROW<text STRING>"),
+    },
+    result_type="ROW<count BIGINT, previous STRING>",
 )
+def count_and_remember(ctx, count_state, last_state, event):
+    previous = last_state.text
+    count_state["value"] = (count_state.value or 0) + 1
+    last_state["text"] = event.text
+    yield Row(count=count_state.value, previous=previous)
+
+    if event.text == "reset":
+        ctx.clear_state("count_state")
 ```
 
 **预期：** 状态按声明顺序、作为可变 `Row` 注入，并在 generator 消费完成后自动
@@ -300,13 +270,22 @@ from datetime import datetime
 from pyflink.common import Instant
 
 
-def eval(self, ctx, event):
+@udptf(
+    arguments={
+        "event": table_arg(
+            traits={Trait.ROW_SEMANTIC_TABLE, Trait.REQUIRE_ON_TIME}
+        ),
+    },
+    result_type="ROW<event_time BIGINT>",
+)
+def inspect_time(ctx, event):
     epoch_millis = ctx.time_context(int).time()
     instant = ctx.time_context(Instant).time()
     utc_datetime = ctx.time_context(datetime).time()
 
     table_watermark = ctx.time_context(int).table_watermark()
     ptf_watermark = ctx.time_context(int).current_watermark()
+    yield Row(event_time=epoch_millis)
 ```
 
 **预期：** 同一个时间值可以表示为 epoch 毫秒、`Instant` 或 UTC-naive
@@ -318,22 +297,33 @@ rowtime。`table_watermark()` 返回当前输入表的 watermark，`current_wate
 ### Case 8：named 和 anonymous 事件时间 Timer
 
 ```python
-class Timeout(ProcessTableFunction):
-    def eval(self, ctx, memory, event):
-        timers = ctx.time_context(int)
-        event_time = timers.time()
-        if event_time is not None:
-            timers.register_on_time("timeout", event_time + 10_000)
-            # 同名 Timer 被替换为更晚的时间。
-            timers.register_on_time("timeout", event_time + 20_000)
-            timers.register_on_time(event_time + 30_000)  # anonymous Timer
+@udptf(
+    arguments={
+        "event": table_arg(
+            traits={Trait.SET_SEMANTIC_TABLE, Trait.REQUIRE_ON_TIME}
+        ),
+    },
+    result_type="ROW<timer_name STRING>",
+)
+def timeout(ctx, event):
+    timers = ctx.time_context(int)
+    event_time = timers.time()
+    if event_time is not None:
+        timers.register_on_time("timeout", event_time + 10_000)
+        # 同名 Timer 被替换为更晚的时间。
+        timers.register_on_time("timeout", event_time + 20_000)
+        timers.register_on_time(event_time + 30_000)  # anonymous Timer
 
-        if event.text == "cancel":
-            timers.clear_timer("timeout")
+    if event.text == "cancel":
+        timers.clear_timer("timeout")
 
-    def on_timer(self, ctx, memory):
-        yield Row(timer_name=ctx.current_timer())
-        ctx.clear_all()
+    return
+
+
+@timeout.on_timer
+def timeout_on_timer(ctx):
+    yield Row(timer_name=ctx.current_timer())
+    ctx.clear_all()
 ```
 
 **预期：** 同一 key 下同名 Timer 只保留最后一次注册；anonymous Timer 按时间戳独立注册。
@@ -344,13 +334,16 @@ Timer 的 `clear_all()`。
 ### Case 9：单次调用输出 0-N 条结果
 
 ```python
-class PositiveTokens(ProcessTableFunction):
-    def eval(self, ctx, event):
-        if event.text is None:
-            return
-        for token in event.text.split(" "):
-            if token:
-                yield Row(token=token)
+@udptf(
+    arguments={"event": table_arg()},
+    result_type="ROW<token STRING>",
+)
+def positive_tokens(ctx, event):
+    if event.text is None:
+        return
+    for token in event.text.split(" "):
+        if token:
+            yield Row(token=token)
 ```
 
 **预期：** `text=None` 输出 0 条，`text="flink"` 输出 1 条，
@@ -429,14 +422,20 @@ Timer 参与 checkpoint。
 ### Case 14：读取当前表参数语义
 
 ```python
-class InspectInput(ProcessTableFunction):
-    def eval(self, ctx, event):
-        semantics = ctx.table_semantics_for("event")
-        yield Row(
-            partition_columns=semantics.partition_by_columns(),
-            order_columns=semantics.order_by_columns(),
-            time_column=semantics.time_column(),
-        )
+@udptf(
+    arguments={"event": table_arg(traits={Trait.SET_SEMANTIC_TABLE})},
+    result_type=(
+        "ROW<partition_columns ARRAY<INT>, "
+        "order_columns ARRAY<INT>, time_column INT>"
+    ),
+)
+def inspect_input(ctx, event):
+    semantics = ctx.table_semantics_for("event")
+    yield Row(
+        partition_columns=list(semantics.partition_by_columns()),
+        order_columns=list(semantics.order_by_columns()),
+        time_column=semantics.time_column(),
+    )
 ```
 
 **预期：** context 返回调用点的实际 `DataType`、分区列、排序列及方向、时间列、输入
@@ -446,22 +445,17 @@ tuple 返回；`ctx.get_changelog_mode()` 返回当前 Python PTF 声明的输�
 ### Case 15：更新输入和 changelog 输出
 
 ```python
-class ForwardChanges(ProcessTableFunction):
-    def eval(self, ctx, event):
-        yield Row.of_kind(event.get_row_kind(), value=event.value)
-
-
-forward_changes = udptf(
-    ForwardChanges(),
-    arguments=[ProcessTableFunctionArgument.table(
-        "event",
-        traits={Trait.SET_SEMANTIC_TABLE, Trait.SUPPORT_UPDATES},
-    )],
-    result_type=DataTypes.ROW([
-        DataTypes.FIELD("value", DataTypes.STRING()),
-    ]),
+@udptf(
+    arguments={
+        "event": table_arg(
+            traits={Trait.SET_SEMANTIC_TABLE, Trait.SUPPORT_UPDATES}
+        ),
+    },
+    result_type="ROW<value STRING>",
     changelog_mode=ChangelogMode.all(),
 )
+def forward_changes(ctx, event):
+    yield Row.of_kind(event.get_row_kind(), value=event.value)
 ```
 
 **预期：** 输入 `Row` 保留 `+I/-U/+U/-D`，输出 `RowKind` 不被重置为 INSERT，且运行时
@@ -473,34 +467,29 @@ key 等于 `PARTITION BY` key；retract 输出不要求 upsert key，也可以�
 ### Case 16：`ListView`、`MapView` 和 Value State 混用
 
 ```python
-class TrackHistory(ProcessTableFunction):
-    def eval(self, ctx, memory, history, counts, event):
-        memory["total"] = (memory.total or 0) + 1
-        history.add(event.value)
-        counts.put(event.value, (counts.get(event.value) or 0) + 1)
-        yield Row(memory.total, len(list(history.get())), counts.get(event.value))
+from pyflink.table.udf import list_view_state, map_view_state, value_state
 
 
-track_history = udptf(
-    TrackHistory(),
-    arguments=[ProcessTableFunctionArgument.table(
-        "event", traits={Trait.SET_SEMANTIC_TABLE})],
-    states=[
-        ProcessTableFunctionState.value(
-            "memory",
-            DataTypes.ROW([DataTypes.FIELD("total", DataTypes.BIGINT())])),
-        ProcessTableFunctionState.list_view(
-            "history", DataTypes.STRING(), ttl=Duration.of_days(1)),
-        ProcessTableFunctionState.map_view(
-            "counts", DataTypes.STRING(), DataTypes.BIGINT(),
-            ttl=Duration.of_days(7)),
-    ],
-    result_type=DataTypes.ROW([
-        DataTypes.FIELD("total", DataTypes.BIGINT()),
-        DataTypes.FIELD("history_size", DataTypes.INT()),
-        DataTypes.FIELD("value_count", DataTypes.BIGINT()),
-    ]),
+@udptf(
+    arguments={
+        "event": table_arg(traits={Trait.SET_SEMANTIC_TABLE}),
+    },
+    states={
+        "memory": value_state("ROW<total BIGINT>"),
+        "history": list_view_state(
+            DataTypes.STRING(), ttl=Duration.of_days(1)
+        ),
+        "counts": map_view_state(
+            DataTypes.STRING(), DataTypes.BIGINT(), ttl=Duration.of_days(7)
+        ),
+    },
+    result_type="ROW<total BIGINT, history_size INT, value_count BIGINT>",
 )
+def track_history(ctx, memory, history, counts, event):
+    memory["total"] = (memory.total or 0) + 1
+    history.add(event.value)
+    counts.put(event.value, (counts.get(event.value) or 0) + 1)
+    yield Row(memory.total, len(list(history.get())), counts.get(event.value))
 ```
 
 **预期：** View 操作直接访问 keyed managed state，不在回调前后整体复制集合。
@@ -536,15 +525,40 @@ savepoint、rescale、多 backend、压力、性能或长期稳定性矩阵。
 
 ## API 约定
 
-状态和 Timer 使用固定的回调签名，状态参数位于函数参数之前：
+`arguments` mapping 的 key 是 PTF 参数名，value 使用 `table_arg()` 声明表参数，或直接使用
+`DataType`/类型字符串声明标量参数。`states` mapping 的 key 是状态名，value 使用
+`value_state()`、`list_view_state()` 或 `map_view_state()` 声明类型和 TTL。两个 mapping
+都保留插入顺序；`table_arg()` 默认使用 Row semantics。`result_type` 同时接受 `DataType`
+和类型字符串。
+
+状态和 Timer 使用固定的回调签名，状态参数位于业务参数之前。Timer callback 通过已装饰
+函数的 `on_timer` decorator 绑定：
 
 ```python
-def eval(self, ctx, state1, state2, table_arg, scalar_arg):
+@udptf(
+    arguments={
+        "table_arg": table_arg(traits={Trait.SET_SEMANTIC_TABLE}),
+        "scalar_arg": DataTypes.STRING(),
+    },
+    states={
+        "state1": value_state("ROW<count BIGINT>"),
+        "state2": list_view_state(DataTypes.STRING()),
+    },
+    result_type="ROW<result STRING>",
+)
+def process_records(ctx, state1, state2, table_arg, scalar_arg):
     ...
 
-def on_timer(self, ctx, state1, state2):
+
+@process_records.on_timer
+def process_records_on_timer(ctx, state1, state2):
     ...
 ```
+
+`udptf()` 校验回调参数名和 mapping key 完全匹配。类风格 PTF 仍使用
+`eval(self, ctx, ...)` 和 `on_timer(self, ctx, ...)`，但不是本文示例的推荐写法。
+主回调或 Timer callback 返回 `None` 表示输出 0 条记录；返回 generator/iterator 时按
+迭代顺序输出 0-N 条记录。
 
 状态和 Timer 要求 Set semantics，Row-semantics PTF 仅支持无状态处理。除非表参数声明了
 `REQUIRE_ON_TIME`，否则 `on_time` 是可选参数。传入 `on_time` 后，PTF 可以访问当前行时间，
@@ -557,11 +571,12 @@ def on_timer(self, ctx, state1, state2):
 - 仅支持 Streaming 和 Process Python worker，不支持 Batch 和 Embedded Python mode。
 - `result_type` 必须是顶层 `ROW` 类型，不支持顶层标量、`ARRAY`、`MAP`、`RAW` 或动态
   结果类型。
-- 输出 changelog mode 必须在 `udptf()` 中固定声明，不支持根据 planning context 动态
+- 输出 changelog mode 必须在 `@udptf` 中固定声明，不支持根据 planning context 动态
   选择输出 mode。
 - `table_semantics_for()` 覆盖单表核心 metadata，不包含尚未暴露的高级 Java context API。
 - 状态和 Timer 要求 Set semantics，Timer 不能与 pass-through columns 同时使用。
-- Timer 仅支持事件时间，并且注册 Timer 的函数必须实现 `on_timer()`。
+- Timer 仅支持事件时间，并且注册 Timer 的函数必须通过 `@function.on_timer` 绑定回调；
+  类风格函数则必须实现 `on_timer()`。
 - Python PTF 必须先注册名称，不支持 inline Python 函数实例或函数类。
 - 业务 scalar/table arguments 当前全部必填，不支持 optional arguments。
 - Phase 1 仅包含固定并行度、HashMap backend 的最小恢复门禁，不包含 savepoint、rescale、
@@ -590,9 +605,10 @@ def on_timer(self, ctx, state1, state2):
 
 阶段一内部按以下里程碑推进，但这些里程碑属于同一个单表能力阶段：
 
-#### 1A Core：append-only MVP，已完成
+#### 1A Core：append-only MVP，底层已完成
 
-- 提供 `ProcessTableFunction`、`udptf()`、参数、状态和 Trait API。
+- 提供 `@udptf`、`table_arg()`、状态 descriptor、Trait API，以及兼容复杂实现的
+  `ProcessTableFunction` 类风格。
 - 支持注册名称后的 `Table.process()`、`PartitionedTable.process()` 和
   `TableEnvironment.from_call()`。
 - 支持单表 append-only 输入输出、Row/Set semantics、分区、pass-through 和 on-time。
@@ -609,7 +625,7 @@ def on_timer(self, ctx, state1, state2):
 
 #### 1C State Views：增量集合状态
 
-- 支持 `ProcessTableFunctionState.list_view()` 和 `map_view()`。
+- 支持 `list_view_state()` 和 `map_view_state()`。
 - 回调中注入 state-backed `ListView` 和 `MapView`，操作直接访问 Flink keyed managed
   state，不整体反序列化和写回集合。
 - 支持按状态独立 TTL、按 key 隔离、增删迭代，以及与 Value State 混用。
@@ -667,7 +683,7 @@ result = ordered_events.process(
 Python context 的目标使用方式为：
 
 ```python
-def eval(self, ctx, event):
+def inspect_ordering(ctx, event):
     semantics = ctx.table_semantics_for("event")
     input_type = semantics.data_type()
     partition_columns = semantics.partition_by_columns()
@@ -716,42 +732,33 @@ PTF 的校验规则。例如，更新表不能使用 pass-through columns，接�
 
 ```python
 from pyflink.common import Row
-from pyflink.table import ChangelogMode, DataTypes
+from pyflink.table import ChangelogMode
 from pyflink.table.udf import (
-    ProcessTableFunction,
-    ProcessTableFunctionArgument,
     ProcessTableFunctionArgumentTrait as Trait,
+    table_arg,
     udptf,
 )
 
 
-class AuditUpdates(ProcessTableFunction):
-    def eval(self, ctx, event):
-        # 输出 Row 没有显式设置 RowKind，因此每条审计记录都是 INSERT。
-        yield Row(
-            input_kind=event.get_row_kind().name,
-            score=event.score,
-        )
-
-
-audit_updates = udptf(
-    AuditUpdates(),
-    arguments=[
-        ProcessTableFunctionArgument.table(
-            "event",
+@udptf(
+    arguments={
+        "event": table_arg(
             traits={
                 Trait.SET_SEMANTIC_TABLE,
                 Trait.SUPPORT_UPDATES,
                 Trait.REQUIRE_UPDATE_BEFORE,
             },
         )
-    ],
-    result_type=DataTypes.ROW([
-        DataTypes.FIELD("input_kind", DataTypes.STRING()),
-        DataTypes.FIELD("score", DataTypes.BIGINT()),
-    ]),
+    },
+    result_type="ROW<input_kind STRING, score BIGINT>",
     changelog_mode=ChangelogMode.insert_only(),
 )
+def audit_updates(ctx, event):
+    # 输出 Row 没有显式设置 RowKind，因此每条审计记录都是 INSERT。
+    yield Row(
+        input_kind=event.get_row_kind().name,
+        score=event.score,
+    )
 ```
 
 假设 `event` 已按 `user_id` 分区，输入与输出的对应关系为：
@@ -774,49 +781,36 @@ audit_updates = udptf(
 
 ```python
 from pyflink.common import Row, RowKind
-from pyflink.table import ChangelogMode, DataTypes
-from pyflink.table.udf import ProcessTableFunctionState
+from pyflink.table import ChangelogMode
+from pyflink.table.udf import value_state
 
 
-class RetractSum(ProcessTableFunction):
-    def eval(self, ctx, memory, event):
-        old_sum = memory.sum
-
-        if event.action == "RESET":
-            if old_sum is not None:
-                yield Row.of_kind(RowKind.DELETE, sum=old_sum)
-            ctx.clear_state("memory")
-            return
-
-        new_sum = (old_sum or 0) + event.score
-        if old_sum is None:
-            yield Row.of_kind(RowKind.INSERT, sum=new_sum)
-        else:
-            yield Row.of_kind(RowKind.UPDATE_BEFORE, sum=old_sum)
-            yield Row.of_kind(RowKind.UPDATE_AFTER, sum=new_sum)
-        memory["sum"] = new_sum
-
-
-retract_sum = udptf(
-    RetractSum(),
-    arguments=[
-        ProcessTableFunctionArgument.table(
-            "event", traits={Trait.SET_SEMANTIC_TABLE}
-        )
-    ],
-    states=[
-        ProcessTableFunctionState.value(
-            "memory",
-            DataTypes.ROW([
-                DataTypes.FIELD("sum", DataTypes.BIGINT())
-            ]),
-        )
-    ],
-    result_type=DataTypes.ROW([
-        DataTypes.FIELD("sum", DataTypes.BIGINT())
-    ]),
+@udptf(
+    arguments={
+        "event": table_arg(traits={Trait.SET_SEMANTIC_TABLE}),
+    },
+    states={
+        "memory": value_state("ROW<sum BIGINT>"),
+    },
+    result_type="ROW<sum BIGINT>",
     changelog_mode=ChangelogMode.all(),
 )
+def retract_sum(ctx, memory, event):
+    old_sum = memory.sum
+
+    if event.action == "RESET":
+        if old_sum is not None:
+            yield Row.of_kind(RowKind.DELETE, sum=old_sum)
+        ctx.clear_state("memory")
+        return
+
+    new_sum = (old_sum or 0) + event.score
+    if old_sum is None:
+        yield Row.of_kind(RowKind.INSERT, sum=new_sum)
+    else:
+        yield Row.of_kind(RowKind.UPDATE_BEFORE, sum=old_sum)
+        yield Row.of_kind(RowKind.UPDATE_AFTER, sum=new_sum)
+    memory["sum"] = new_sum
 ```
 
 调用和结果示意如下：
@@ -859,7 +853,7 @@ semantics、`ORDER BY`、changelog、状态恢复和 Timer 语义。仍然存在
 | Changelog 推导 | `getChangelogMode(context)` 可以根据输入和下游要求动态选择 mode | 1B 支持固定 append/upsert/retract 声明 | 动态 planning context 放在阶段三评估 |
 | Table semantics context | Java context 暴露完整表语义 | 1B 暴露单表核心 metadata | 剩余高级 context API 放在阶段三补齐 |
 | Inline 调用 | Java Table API 可以直接传入 PTF class，不要求先注册名称 | Python PTF 仍必须先注册名称 | 阶段三评估 inline Python PTF |
-| 可选参数 | Java 静态签名支持 optional scalar/table arguments | `udptf()` 中声明的业务参数全部必填 | 阶段三补齐 |
+| 可选参数 | Java 静态签名支持 optional scalar/table arguments | `@udptf` 中声明的业务参数全部必填 | 阶段三补齐 |
 | 高级类型推导 | 支持反射、`@DataTypeHint`、POJO/STRUCTURED/RAW 和覆盖 `getTypeInference()` | 使用显式 Python `DataType`，不承诺自定义 structured object、`RAW` 或动态输出 schema | 阶段三设计 Python API 和 coder |
 | Python 执行模式 | 不适用；Java PTF 直接在 JVM operator 中运行 | 仍只支持 Process Python worker | 阶段三评估 Embedded Python mode |
 | 恢复验证矩阵 | Java PTF 已覆盖更广泛的 checkpoint/savepoint 和运行时组合 | Phase 1 只覆盖固定并行度、HashMap backend 的 checkpoint/failover/TTL 门禁 | Post-Phase-1 Hardening 补 savepoint、rescale、backend、压力和性能矩阵 |
@@ -944,20 +938,14 @@ pass-through 约束、核心 `table_semantics_for()`、`ORDER BY`、append/upser
 顶层标量的目标定义方式为：
 
 ```python
-class DoubleScore(ProcessTableFunction):
-    def eval(self, ctx, event):
-        yield event.score * 2
-
-
-double_score = udptf(
-    DoubleScore(),
-    arguments=[
-        ProcessTableFunctionArgument.table(
-            "event", traits={Trait.ROW_SEMANTIC_TABLE}
-        ),
-    ],
+@udptf(
+    arguments={
+        "event": table_arg(traits={Trait.ROW_SEMANTIC_TABLE}),
+    },
     result_type=DataTypes.BIGINT(),
 )
+def double_score(ctx, event):
+    yield event.score * 2
 ```
 
 输出归一化需要固定以下语义：
@@ -968,7 +956,7 @@ double_score = udptf(
   `yield`、不带值的 `return` 或空 iterator 表示输出 0 条。
 - `yield from values` 仍表示 N 条输出，不会因为顶层类型是集合而改变 generator 语义。
 - 隐式包装后，分区键或 pass-through 列仍位于函数结果之前，rowtime 仍位于结果之后。
-- `eval()` 和 `on_timer()` 使用同一套结果序列化和 0-N 条输出规则。
+- 主回调和 Timer callback 使用同一套结果序列化和 0-N 条输出规则。
 
 阶段三需要覆盖标量、`ARRAY`、`MAP`、显式 `ROW`、`NULL`、0-N 条输出、Timer 回调、
 append/upsert/retract 输出，以及与分区键、pass-through 列和 rowtime 的合法组合。
