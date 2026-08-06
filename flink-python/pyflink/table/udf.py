@@ -19,13 +19,14 @@ import abc
 import enum
 import functools
 import inspect
+from collections.abc import Mapping
 from typing import Union, List, Type, Callable, TypeVar, Generic, Iterable, Optional, Sequence, Set
 
 from pyflink.java_gateway import get_gateway
 from pyflink.metrics import MetricGroup
 from pyflink.table import Expression
 from pyflink.table.changelog_mode import ChangelogMode
-from pyflink.table.types import DataType, _to_java_data_type
+from pyflink.table.types import DataType, _from_java_data_type, _to_java_data_type
 from pyflink.util import java_utils
 from pyflink.util.api_stability_decorators import PublicEvolving, Internal
 
@@ -33,7 +34,8 @@ __all__ = ['FunctionContext', 'AggregateFunction', 'ScalarFunction', 'TableFunct
            'TableAggregateFunction', 'AsyncScalarFunction', 'ProcessTableFunction',
            'ProcessTableFunctionArgument', 'ProcessTableFunctionState',
            'ProcessTableFunctionArgumentTrait', 'ProcessTableFunctionTableSemantics',
-           'ProcessTableFunctionSortDirection', 'udf', 'udtf', 'udptf', 'udaf', 'udtaf']
+           'ProcessTableFunctionSortDirection', 'table_arg', 'value_state',
+           'list_view_state', 'map_view_state', 'udf', 'udtf', 'udptf', 'udaf', 'udtaf']
 
 
 @PublicEvolving()
@@ -276,6 +278,83 @@ class ProcessTableFunctionArgumentTrait(enum.Enum):
     REQUIRE_FULL_DELETE = 'REQUIRE_FULL_DELETE'
 
 
+def _normalize_process_table_function_argument_traits(traits):
+    normalized_traits = set(
+        traits or {ProcessTableFunctionArgumentTrait.ROW_SEMANTIC_TABLE})
+    if not all(isinstance(t, ProcessTableFunctionArgumentTrait) for t in normalized_traits):
+        raise TypeError(
+            "Table argument traits must be ProcessTableFunctionArgumentTrait values.")
+    row_semantics = ProcessTableFunctionArgumentTrait.ROW_SEMANTIC_TABLE
+    set_semantics = ProcessTableFunctionArgumentTrait.SET_SEMANTIC_TABLE
+    if row_semantics in normalized_traits and set_semantics in normalized_traits:
+        raise ValueError("A table argument cannot have both row and set semantics.")
+    if row_semantics not in normalized_traits and set_semantics not in normalized_traits:
+        normalized_traits.add(row_semantics)
+    return frozenset(normalized_traits)
+
+
+def _validate_process_table_function_state_ttl(ttl):
+    if ttl is not None:
+        from pyflink.common import Duration
+        if not isinstance(ttl, Duration):
+            raise TypeError("State TTL must be a pyflink.common.Duration.")
+
+
+class _ProcessTableFunctionTableArgumentDescriptor(object):
+
+    def __init__(self, data_type, traits):
+        if data_type is not None and not isinstance(data_type, (DataType, str)):
+            raise TypeError("A table argument data type must be a DataType or str.")
+        self.data_type = data_type
+        self.traits = _normalize_process_table_function_argument_traits(traits)
+
+
+class _ProcessTableFunctionStateDescriptor(object):
+
+    def __init__(self, state_kind, data_types, ttl):
+        if not all(isinstance(data_type, (DataType, str)) for data_type in data_types):
+            raise TypeError("State data types must be DataType or str values.")
+        _validate_process_table_function_state_ttl(ttl)
+        self.state_kind = state_kind
+        self.data_types = tuple(data_types)
+        self.ttl = ttl
+
+
+def table_arg(data_type: Union[DataType, str] = None,
+              traits: Optional[Set[ProcessTableFunctionArgumentTrait]] = None):
+    """Declares a table argument in an ``udptf`` argument mapping.
+
+    Row semantics are used by default. The argument name is supplied by the mapping key.
+
+    .. versionadded:: 2.4.0
+    """
+    return _ProcessTableFunctionTableArgumentDescriptor(data_type, traits)
+
+
+def value_state(data_type: Union[DataType, str], ttl=None):
+    """Declares a keyed ROW value state in an ``udptf`` state mapping.
+
+    .. versionadded:: 2.4.0
+    """
+    return _ProcessTableFunctionStateDescriptor('value', (data_type,), ttl)
+
+
+def list_view_state(element_type: Union[DataType, str], ttl=None):
+    """Declares a state-backed ``ListView`` in an ``udptf`` state mapping.
+
+    .. versionadded:: 2.4.0
+    """
+    return _ProcessTableFunctionStateDescriptor('list_view', (element_type,), ttl)
+
+
+def map_view_state(key_type: Union[DataType, str], value_type: Union[DataType, str], ttl=None):
+    """Declares a state-backed ``MapView`` in an ``udptf`` state mapping.
+
+    .. versionadded:: 2.4.0
+    """
+    return _ProcessTableFunctionStateDescriptor('map_view', (key_type, value_type), ttl)
+
+
 @PublicEvolving()
 class ProcessTableFunctionSortDirection(enum.Enum):
     """Sort direction for an ``ORDER BY`` column of a PTF table argument."""
@@ -371,16 +450,7 @@ class ProcessTableFunctionArgument(object):
         """Declares a polymorphic or explicitly typed table argument."""
         if data_type is not None and not isinstance(data_type, DataType):
             raise TypeError("A table argument data type must be a DataType.")
-        normalized_traits = set(traits or {ProcessTableFunctionArgumentTrait.ROW_SEMANTIC_TABLE})
-        if not all(isinstance(t, ProcessTableFunctionArgumentTrait) for t in normalized_traits):
-            raise TypeError(
-                "Table argument traits must be ProcessTableFunctionArgumentTrait values.")
-        row_semantics = ProcessTableFunctionArgumentTrait.ROW_SEMANTIC_TABLE
-        set_semantics = ProcessTableFunctionArgumentTrait.SET_SEMANTIC_TABLE
-        if row_semantics in normalized_traits and set_semantics in normalized_traits:
-            raise ValueError("A table argument cannot have both row and set semantics.")
-        if row_semantics not in normalized_traits and set_semantics not in normalized_traits:
-            normalized_traits.add(row_semantics)
+        normalized_traits = _normalize_process_table_function_argument_traits(traits)
         return ProcessTableFunctionArgument(name, data_type, True, normalized_traits)
 
 
@@ -398,10 +468,7 @@ class ProcessTableFunctionState(object):
         if not isinstance(data_type, (RowType, ListViewType, MapViewType)):
             raise TypeError(
                 "Process table function state must use a ROW, LIST_VIEW, or MAP_VIEW data type.")
-        if ttl is not None:
-            from pyflink.common import Duration
-            if not isinstance(ttl, Duration):
-                raise TypeError("State TTL must be a pyflink.common.Duration.")
+        _validate_process_table_function_state_ttl(ttl)
         self.name = name
         self.data_type = data_type
         self.ttl = ttl
@@ -595,6 +662,23 @@ class DelegationTableFunction(TableFunction):
 
     def eval(self, *args):
         return self.func(*args)
+
+
+@Internal()
+class DelegatingProcessTableFunction(ProcessTableFunction):
+    """Helper process table function implementation for a decorated Python function."""
+
+    def __init__(self, func, on_timer_func=None):
+        self.func = func
+        self.on_timer_func = on_timer_func
+
+    def eval(self, ctx, *args):
+        return self.func(ctx, *args)
+
+    def on_timer(self, ctx, *states):
+        if self.on_timer_func is None:
+            return ()
+        return self.on_timer_func(ctx, *states)
 
 
 @Internal()
@@ -878,7 +962,7 @@ class UserDefinedTableFunctionWrapper(UserDefinedFunctionWrapper):
 class UserDefinedProcessTableFunctionWrapper(UserDefinedFunctionWrapper):
     """Wrapper for a Python user-defined process table function."""
 
-    def __init__(self, func: ProcessTableFunction,
+    def __init__(self, func: Union[ProcessTableFunction, Callable],
                  arguments: Sequence[ProcessTableFunctionArgument],
                  states: Sequence[ProcessTableFunctionState], result_type: DataType,
                  changelog_mode: ChangelogMode, deterministic=None, name=None):
@@ -888,7 +972,37 @@ class UserDefinedProcessTableFunctionWrapper(UserDefinedFunctionWrapper):
         self._states = tuple(states)
         self._result_type = result_type
         self._changelog_mode = changelog_mode
-        self._has_on_timer = func.__class__.on_timer is not ProcessTableFunction.on_timer
+        self._on_timer_func: Optional[Callable] = None
+        self._has_on_timer = isinstance(func, ProcessTableFunction) and \
+            func.__class__.on_timer is not ProcessTableFunction.on_timer
+
+    def on_timer(self, f: Callable):
+        """Binds a timer callback to a function-based process table function."""
+        if isinstance(self._func, ProcessTableFunction):
+            raise TypeError(
+                "The on_timer decorator is only supported for function-based process table "
+                "functions.")
+        if not callable(f):
+            raise TypeError("The on_timer callback must be callable.")
+        if self._on_timer_func is not None:
+            raise ValueError("A process table function can only declare one on_timer callback.")
+        if self._judf_placeholder is not None:
+            raise RuntimeError(
+                "The on_timer callback must be declared before registering the process table "
+                "function.")
+
+        table_argument = next(argument for argument in self._arguments if argument.is_table)
+        set_semantics = ProcessTableFunctionArgumentTrait.SET_SEMANTIC_TABLE
+        if set_semantics not in table_argument.traits:
+            raise ValueError("Timers require a table argument with set semantics.")
+        if ProcessTableFunctionArgumentTrait.PASS_COLUMNS_THROUGH in table_argument.traits:
+            raise ValueError("Timers do not support pass-through columns.")
+        _validate_process_table_function_callback_signature(
+            f, 'on_timer', ['ctx'] + [state.name for state in self._states])
+
+        self._on_timer_func = f
+        self._has_on_timer = True
+        return f
 
     def _create_judf(self, serialized_func, j_input_types, j_function_kind):
         gateway = get_gateway()
@@ -935,7 +1049,7 @@ class UserDefinedProcessTableFunctionWrapper(UserDefinedFunctionWrapper):
             _get_python_env())
 
     def _create_delegate_function(self) -> UserDefinedFunction:
-        raise TypeError("A process table function must extend ProcessTableFunction.")
+        return DelegatingProcessTableFunction(self._func, self._on_timer_func)
 
 
 class UserDefinedAggregateFunctionWrapper(UserDefinedFunctionWrapper):
@@ -1178,9 +1292,9 @@ def udtf(f: Union[Callable, TableFunction, Type] = None,
         return _create_udtf(f, input_types, result_types, deterministic, name)
 
 
-def _validate_process_table_function_signature(func, method_name, expected_names):
-    method = getattr(func, method_name)
-    parameters = list(inspect.signature(method).parameters.values())
+def _validate_process_table_function_callback_signature(
+        callback, callback_name, expected_names):
+    parameters = list(inspect.signature(callback).parameters.values())
     invalid_kind = any(parameter.kind not in (
         inspect.Parameter.POSITIONAL_ONLY,
         inspect.Parameter.POSITIONAL_OR_KEYWORD) for parameter in parameters)
@@ -1188,23 +1302,126 @@ def _validate_process_table_function_signature(func, method_name, expected_names
     if invalid_kind or actual_names != expected_names:
         raise ValueError(
             "Invalid {}() signature. Expected ({}) but found ({}).".format(
-                method_name, ', '.join(expected_names), ', '.join(actual_names)))
+                callback_name, ', '.join(expected_names), ', '.join(actual_names)))
 
 
-def udptf(f: Union[ProcessTableFunction, Type] = None,
-          arguments: Sequence[ProcessTableFunctionArgument] = None,
-          result_type: DataType = None,
-          states: Sequence[ProcessTableFunctionState] = None,
+def _validate_process_table_function_signature(func, method_name, expected_names):
+    _validate_process_table_function_callback_signature(
+        getattr(func, method_name), method_name, expected_names)
+
+
+def _normalize_process_table_function_data_type(data_type, parameter_name):
+    if isinstance(data_type, DataType):
+        return data_type
+    if not isinstance(data_type, str):
+        raise TypeError("{} must be a DataType or str.".format(parameter_name))
+
+    try:
+        gateway = get_gateway()
+        class_loader = gateway.jvm.Thread.currentThread().getContextClassLoader()
+        logical_type = gateway.jvm.org.apache.flink.table.types.logical.utils \
+            .LogicalTypeParser.parse(data_type, class_loader)
+        java_data_type = gateway.jvm.org.apache.flink.table.api.DataTypes.of(logical_type)
+        return _from_java_data_type(java_data_type)
+    except Exception as exc:
+        raise ValueError(
+            "Invalid type string for {}: {}.".format(parameter_name, data_type)) from exc
+
+
+def _normalize_process_table_function_arguments(arguments):
+    if arguments is None:
+        raise ValueError("Process table function arguments must be declared.")
+    if isinstance(arguments, Mapping):
+        normalized_arguments = []
+        for name, descriptor in arguments.items():
+            if isinstance(descriptor, _ProcessTableFunctionTableArgumentDescriptor):
+                data_type = descriptor.data_type
+                if data_type is not None:
+                    data_type = _normalize_process_table_function_data_type(
+                        data_type, "Table argument '{}' data type".format(name))
+                normalized_arguments.append(
+                    ProcessTableFunctionArgument.table(
+                        name, traits=descriptor.traits, data_type=data_type))
+            elif isinstance(descriptor, (DataType, str)):
+                normalized_arguments.append(
+                    ProcessTableFunctionArgument.scalar(
+                        name,
+                        _normalize_process_table_function_data_type(
+                            descriptor, "Scalar argument '{}' data type".format(name))))
+            else:
+                raise TypeError(
+                    "Argument '{}' must use table_arg(), a DataType, or a type string."
+                    .format(name))
+        return normalized_arguments
+    if not isinstance(arguments, (list, tuple)) or not all(
+            isinstance(argument, ProcessTableFunctionArgument) for argument in arguments):
+        raise TypeError(
+            "arguments must be a mapping or an ordered list of "
+            "ProcessTableFunctionArgument values.")
+    return list(arguments)
+
+
+def _normalize_process_table_function_states(states):
+    if states is None:
+        return []
+    if isinstance(states, Mapping):
+        normalized_states = []
+        for name, descriptor in states.items():
+            if not isinstance(descriptor, _ProcessTableFunctionStateDescriptor):
+                raise TypeError(
+                    "State '{}' must use value_state(), list_view_state(), or map_view_state()."
+                    .format(name))
+            data_types = [
+                _normalize_process_table_function_data_type(
+                    data_type, "State '{}' data type".format(name))
+                for data_type in descriptor.data_types
+            ]
+            if descriptor.state_kind == 'value':
+                state = ProcessTableFunctionState.value(
+                    name, data_types[0], descriptor.ttl)
+            elif descriptor.state_kind == 'list_view':
+                state = ProcessTableFunctionState.list_view(
+                    name, data_types[0], descriptor.ttl)
+            else:
+                state = ProcessTableFunctionState.map_view(
+                    name, data_types[0], data_types[1], descriptor.ttl)
+            normalized_states.append(state)
+        return normalized_states
+    if not isinstance(states, (list, tuple)) or not all(
+            isinstance(state, ProcessTableFunctionState) for state in states):
+        raise TypeError(
+            "states must be a mapping or an ordered list of ProcessTableFunctionState values.")
+    return list(states)
+
+
+def udptf(f: Union[Callable, ProcessTableFunction, Type] = None,
+          arguments=None,
+          result_type: Union[DataType, str] = None,
+          states=None,
           changelog_mode: ChangelogMode = None,
           deterministic: bool = None,
           name: str = None):
     """
     Creates a Python user-defined process table function.
 
-    The ``eval`` callback receives ``ctx``, all declared states, and all declared arguments in
-    exactly that order. An optional ``on_timer`` callback receives ``ctx`` and all states.
-    ``changelog_mode`` declares the row kinds that the function can produce and defaults to
-    :func:`~pyflink.table.ChangelogMode.insert_only`.
+    The decorated callback receives ``ctx``, all declared states, and all declared arguments in
+    exactly that order. A timer callback can be attached with ``@function.on_timer``. Class-based
+    process table functions remain supported through ``ProcessTableFunction``. ``changelog_mode``
+    declares the row kinds that the function can produce and defaults to insert-only.
+
+    Example:
+        ::
+
+            >>> @udptf(
+            ...     arguments={
+            ...         "event": table_arg(),
+            ...         "separator": DataTypes.STRING(),
+            ...     },
+            ...     result_type="ROW<token STRING>",
+            ... )
+            ... def tokenize(ctx, event, separator):
+            ...     for token in event.text.split(separator):
+            ...         yield Row(token=token)
 
     .. versionadded:: 2.4.0
     """
@@ -1218,20 +1435,18 @@ def udptf(f: Union[ProcessTableFunction, Type] = None,
             deterministic=deterministic,
             name=name)
 
-    if inspect.isclass(f) and issubclass(f, ProcessTableFunction):
+    if inspect.isclass(f):
+        if not issubclass(f, ProcessTableFunction):
+            raise TypeError(
+                "A process table function class must extend ProcessTableFunction.")
         f = f()
-    if not isinstance(f, ProcessTableFunction):
-        raise TypeError("A process table function must extend ProcessTableFunction.")
-    if arguments is None:
-        raise ValueError("Process table function arguments must be declared.")
-    if not isinstance(arguments, (list, tuple)) or not all(
-            isinstance(argument, ProcessTableFunctionArgument) for argument in arguments):
-        raise TypeError("arguments must be an ordered list of ProcessTableFunctionArgument values.")
-    if states is None:
-        states = []
-    if not isinstance(states, (list, tuple)) or not all(
-            isinstance(state, ProcessTableFunctionState) for state in states):
-        raise TypeError("states must be an ordered list of ProcessTableFunctionState values.")
+    if not isinstance(f, ProcessTableFunction) and not callable(f):
+        raise TypeError("A process table function must be callable or extend ProcessTableFunction.")
+
+    arguments = _normalize_process_table_function_arguments(arguments)
+    states = _normalize_process_table_function_states(states)
+    result_type = _normalize_process_table_function_data_type(result_type, "result_type")
+
     from pyflink.table.types import RowType
     if not isinstance(result_type, RowType):
         raise TypeError("result_type must be a ROW DataType.")
@@ -1253,9 +1468,14 @@ def udptf(f: Union[ProcessTableFunction, Type] = None,
 
     state_names = [state.name for state in states]
     argument_names = [argument.name for argument in arguments]
-    _validate_process_table_function_signature(
-        f, 'eval', ['ctx'] + state_names + argument_names)
-    if f.__class__.on_timer is not ProcessTableFunction.on_timer:
+    expected_eval_names = ['ctx'] + state_names + argument_names
+    if isinstance(f, ProcessTableFunction):
+        _validate_process_table_function_signature(f, 'eval', expected_eval_names)
+    else:
+        _validate_process_table_function_callback_signature(f, 'eval', expected_eval_names)
+
+    if isinstance(f, ProcessTableFunction) and \
+            f.__class__.on_timer is not ProcessTableFunction.on_timer:
         if ProcessTableFunctionArgumentTrait.SET_SEMANTIC_TABLE not in table_arguments[0].traits:
             raise ValueError("Timers require a table argument with set semantics.")
         if ProcessTableFunctionArgumentTrait.PASS_COLUMNS_THROUGH in table_arguments[0].traits:

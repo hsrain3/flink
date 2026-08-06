@@ -25,7 +25,11 @@ from pyflink.table.udf import (
     ProcessTableFunctionArgument,
     ProcessTableFunctionArgumentTrait as Trait,
     ProcessTableFunctionState,
+    list_view_state,
+    map_view_state,
+    table_arg,
     udptf,
+    value_state,
 )
 from pyflink.testing.test_case_utils import PyFlinkTestCase
 
@@ -194,6 +198,99 @@ class ProcessTableFunctionTests(PyFlinkTestCase):
         self.assertEqual("PythonProcessTableFunction", java_function.getClass().getSimpleName())
         static_arguments = java_function.getTypeInference(None).getStaticArguments().get()
         self.assertEqual(["event", "separator"], [a.getName() for a in static_arguments])
+
+    def test_pythonic_decorator_execution(self):
+        @udptf(
+            arguments={
+                "event": table_arg(),
+                "separator": "STRING",
+            },
+            result_type="ROW<token STRING>",
+            deterministic=False,
+        )
+        def tokenize(ctx, event, separator):
+            for token in event.text.split(separator):
+                if token:
+                    yield Row(token=token)
+
+        java_function = tokenize._java_user_defined_function()
+        static_arguments = java_function.getTypeInference(None).getStaticArguments().get()
+        self.assertEqual(["event", "separator"], [a.getName() for a in static_arguments])
+        self.assertFalse(java_function.isDeterministic())
+
+        table_env = TableEnvironment.create(EnvironmentSettings.in_streaming_mode())
+        table_env.get_config().set("python.fn-execution.bundle.size", "1")
+        table_env.create_temporary_system_function("python_tokenize", tokenize)
+        events = table_env.from_elements(
+            [("hello flink",)],
+            DataTypes.ROW([DataTypes.FIELD("text", DataTypes.STRING())]))
+
+        with events.process(
+                "python_tokenize", lit(" ").as_argument("separator")).execute().collect() as rows:
+            self.assertEqual([Row("flink"), Row("hello")], sorted(rows, key=lambda row: row[0]))
+
+    def test_pythonic_state_mapping_and_timer_callback(self):
+        @udptf(
+            arguments={
+                "event": table_arg(traits={Trait.SET_SEMANTIC_TABLE}),
+            },
+            states={
+                "memory": value_state(
+                    "ROW<count BIGINT>", ttl=Duration.of_days(1)),
+                "history": list_view_state("STRING", ttl=Duration.of_hours(1)),
+                "counts": map_view_state(
+                    "STRING", DataTypes.BIGINT(), ttl=Duration.of_hours(2)),
+            },
+            result_type="ROW<count BIGINT>",
+            changelog_mode=ChangelogMode.upsert(False),
+        )
+        def count_with_timeout(ctx, memory, history, counts, event):
+            memory["count"] = (memory.count or 0) + 1
+            history.add(event.value)
+            counts.put(event.value, (counts.get(event.value) or 0) + 1)
+            yield Row(memory.count)
+
+        @count_with_timeout.on_timer
+        def count_with_timeout_timer(ctx, memory, history, counts):
+            yield Row(memory.count)
+
+        java_function = count_with_timeout._java_user_defined_function()
+        state_strategies = java_function.getTypeInference(None).getStateTypeStrategies()
+        self.assertEqual(["memory", "history", "counts"], list(state_strategies.keySet()))
+        self.assertTrue(java_function.hasOnTimer())
+        self.assertEqual(86_400_000, java_function.getStateTimeToLive()[0].toMillis())
+        self.assertTrue(java_function.getChangelogMode(None).contains(
+            RowKind.UPDATE_AFTER.to_j_row_kind()))
+
+        delegate = count_with_timeout._create_delegate_function()
+        self.assertEqual([Row(3)], list(delegate.on_timer(None, Row(count=3), None, None)))
+
+    def test_pythonic_decorator_validates_callback_signatures(self):
+        with self.assertRaisesRegex(ValueError, r"Invalid eval\(\) signature"):
+            @udptf(
+                arguments={
+                    "event": table_arg(),
+                    "separator": DataTypes.STRING(),
+                },
+                result_type="ROW<token STRING>",
+            )
+            def invalid_eval(ctx, separator, event):
+                yield Row(separator)
+
+        @udptf(
+            arguments={
+                "event": table_arg(traits={Trait.SET_SEMANTIC_TABLE}),
+            },
+            states={"memory": value_state("ROW<count BIGINT>")},
+            result_type="ROW<count BIGINT>",
+        )
+        def invalid_timer(ctx, memory, event):
+            yield Row(memory.count)
+
+        with self.assertRaisesRegex(ValueError, r"Invalid on_timer\(\) signature"):
+            @invalid_timer.on_timer
+            def invalid_timer_callback(memory, ctx):
+                yield Row(memory.count)
 
     def test_declares_fixed_changelog_mode(self):
         function = udptf(
